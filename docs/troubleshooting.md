@@ -50,6 +50,10 @@ which the log counts but does not show.
    host, outside every container -- so this one step is on you. After installing it,
    restart Synapse so Wine enumerates the devices again.
 
+   A device that worked without the rule can mean OpenRGB's or OpenRazer's rule was
+   covering it. Theirs list models one by one, so a newer device -- a Naga V3 Pro, where
+   a Naga V2 Pro worked -- can be left root-only while the old one never was.
+
 2. *winebus's switch for Razer.* Without it Wine does not expose a mouse or keyboard as
    a HID device at all, and `main.log` shows the device under `usb.getDevices` and
    never under `hid.openDevice`. The setup sets it and the launcher re-asserts it every

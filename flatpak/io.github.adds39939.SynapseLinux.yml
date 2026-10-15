@@ -170,6 +170,9 @@ modules:
       - type: patch
         path: ../patches/25-winebus-razer-keep-normal-mode.patch
         strip-components: 0
+      - type: patch
+        path: ../patches/26-setupapi-present-devices-only.patch
+        strip-components: 0
 
   # Needed by winetricks to unpack the corefonts and .NET cabs on first run.
   - name: cabextract

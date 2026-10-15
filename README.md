@@ -113,9 +113,12 @@ Verified with a **Naga V2 Pro** on its HyperSpeed receiver (`1532:00a8`):
 * ❓ **Macros.** Synapse reports on-board macro memory for the Naga V2 Pro, so a macro
   may be stored on the mouse and work like any other assignment; none have been tried.
 * ❓ **Hypershift** assignments, and the Scrolling, Power and Calibration pages.
-* ❓ **Any Razer device other than a Naga V2 Pro.** Nothing here is specific to it — the
-  fixes are to device enumeration and Windows features Synapse relies on — so other
-  devices may well work, but none have been tried.
+* ❓ **The Naga V3 Pro** (`1532:00e8`) is found and connected: Synapse installs its
+  module and reads its serial number, and the mouse acknowledges each command and stays
+  in normal mode. Lighting and button assignments on it have not been checked by eye yet.
+* ❓ **Any other Razer device.** Nothing here is specific to the Nagas — the fixes are to
+  device enumeration and Windows features Synapse relies on — so other devices may well
+  work, but none have been tried.
 * ❓ **Firmware updates.** Nothing here has ever written firmware to a device.
 
 ## What doesn't
@@ -175,15 +178,16 @@ else has to be installed: the runtime and the SDK carry the compilers and the li
 
 The patches are `-p0` patches against Wine as upstream ships it. 01–20 are the
 [NZXT CAM on Linux](https://github.com/adds39939/nzxt_cam_linux) series, unchanged, on the
-same Wine 11.16; 21–25 are what Synapse needed on top. To build against a different Wine,
+same Wine 11.16; 21–26 are what Synapse needed on top. To build against a different Wine,
 change the `url` and `sha256` in the manifest's `wine` module and put the same version in
 [`WINE_VERSION`](WINE_VERSION) — CI checks the two agree.
 
-Patches 21–24 are not Synapse-specific: they fix gaps that affect any application that
-walks its child processes, verifies MSIX packages, pairs a USB device with its HID
-interfaces, or shrinks a window to nothing. 25 is the exception, by design — it keeps
-Razer devices in the mode their firmware applies their own assignments in, which only
-makes sense where no Razer filter driver can run.
+Patches 21–24 and 26 are not Synapse-specific: they fix gaps that affect any application
+that walks its child processes, verifies MSIX packages, pairs a USB device with its HID
+interfaces, shrinks a window to nothing, or lists HID devices hidapi's way after one has
+been unplugged. 25 is the exception, by design — it keeps Razer devices in the mode their
+firmware applies their own assignments in, which only makes sense where no Razer filter
+driver can run.
 
 ## Licensing
 

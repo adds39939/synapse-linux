@@ -308,6 +308,43 @@ Synapse's own restore when it quits (`configureDevicesDefaultData`, normal mode)
 through untouched. The `RazerDriverMode` bus option
 (`HKLM\System\CurrentControlSet\Services\WineBus`, `REG_DWORD` 1) turns all of this off.
 
+### 26. A device that is gone is not in the present set
+
+**Symptom:** after one Razer device is swapped for another -- a Naga V2 Pro for a Naga
+V3 Pro -- Synapse opens a tab for the new one and never connects to it. Its log retries
+until it gives up, though the HID devices it is looking for are there:
+
+```
+connectHidDevice(productId:232, ..., deviceContainerId:{153200E8-…}) hidDevices found base on productId, length:0
+```
+
+**Cause:** `node-rz-hid` reads each HID device's container ID the way old hidapi did:
+it enumerates the interfaces of a `DIGCF_PRESENT | DIGCF_DEVICEINTERFACE` set, and for
+the n-th interface asks `SetupDiEnumDeviceInfo` for the n-th device of the same set. On
+Windows those are the same device, because a set of present interfaces holds only the
+devices they belong to.
+
+In Wine it held every device ever registered under the interface class. A device that
+was unplugged keeps its registry keys, with its interfaces unlinked: setupapi skipped
+the interfaces but added the device anyway. Every device unplugged since the prefix was
+made -- here the old Naga's ten HID devices, and a game controller from long ago --
+shifted the pairing by one, and the new mouse's collections were read as the old mouse's
+and the ASUS LED controller's:
+
+```
+interface 4  1532:00e8 mi_00        device[4]  HID\VID_0B05&PID_1AA6&MI_02    {0B051AA6-…}
+interface 5  1532:00e8 mi_01&col01  device[5]  HID\VID_1532&PID_00A8&MI_00   {153200A8-…}
+...                                                         19 interfaces, 30 devices
+```
+
+It worked for the first device only because nothing had been unplugged yet; unplugging
+any device winebus exposes -- a Razer one, or a game controller -- breaks every device
+listed after it.
+
+**Fix:** with `DIGCF_PRESENT`, a device goes into an interface set only if one of its
+interfaces is linked -- what Windows does. The same prefix then gives 19 interfaces and
+19 devices, each the interface's own.
+
 ## Things that are not fixed, and why
 
 ### Razer's filter driver, and driver mode

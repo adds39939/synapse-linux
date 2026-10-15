@@ -1,0 +1,46 @@
+diff --git dlls/setupapi/devinst.c dlls/setupapi/devinst.c
+index 129698f..8d1e5ac 100644
+--- dlls/setupapi/devinst.c
++++ dlls/setupapi/devinst.c
+@@ -1935,6 +1935,25 @@ end:
+     return ret;
+ }
+ 
++/* Whether any of the device's interfaces under this class key is present. */
++static BOOL has_linked_interface(HKEY key)
++{
++    WCHAR name[MAX_PATH];
++    DWORD i, len;
++    HKEY subkey;
++    BOOL ret = FALSE;
++
++    for (i = 0; !ret; i++)
++    {
++        len = ARRAY_SIZE(name);
++        if (RegEnumKeyExW(key, i, name, &len, NULL, NULL, NULL, NULL)) break;
++        if (*name != '#' || RegOpenKeyExW(key, name, 0, KEY_READ, &subkey)) continue;
++        ret = is_linked(subkey);
++        RegCloseKey(subkey);
++    }
++    return ret;
++}
++
+ static void SETUPDI_AddDeviceInterfaces(struct device *device, HKEY key,
+     const GUID *guid, DWORD flags)
+ {
+@@ -2013,7 +2032,14 @@ static void SETUPDI_EnumerateMatchingInterfaces(HDEVINFO DeviceInfoSet,
+                 if (!l && dataType == REG_SZ)
+                 {
+                     TRACE("found instance ID %s\n", debugstr_w(deviceInst));
+-                    if (!enumstr || !lstrcmpiW(enumstr, deviceInst))
++                    /* A device that is gone keeps its registry keys, with its
++                     * interfaces unlinked. Windows leaves it out of a DIGCF_PRESENT
++                     * set, and applications depend on that: hidapi takes the n-th
++                     * device of the set to be the n-th interface's, so one device
++                     * unplugged earlier would pair every interface after it with
++                     * the wrong device. */
++                    if ((!enumstr || !lstrcmpiW(enumstr, deviceInst)) &&
++                        (!(flags & DIGCF_PRESENT) || has_linked_interface(subKey)))
+                     {
+                         HKEY deviceKey;
+ 
