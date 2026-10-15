@@ -103,8 +103,13 @@ jobs:
         run: |
           # elfutils is not a dependency of Ubuntu's flatpak-builder, but flatpak-builder
           # strips debug info out of every ELF it installs with eu-strip.
+          #
+          # librsvg2-common is the SVG loader for gdk-pixbuf. The app's icon is an SVG,
+          # and without the loader the AppStream compose at the very end of the build
+          # cannot read it ("file-read-error ... Unrecognized image file format") and
+          # fails the whole run -- after the hour Wine takes to build.
           sudo apt-get install -y --no-install-recommends \
-            flatpak flatpak-builder ccache elfutils
+            flatpak flatpak-builder ccache elfutils librsvg2-common
           flatpak remote-add --if-not-exists --user \
             flathub https://flathub.org/repo/flathub.flatpakrepo
           flatpak install -y --user --noninteractive flathub \
