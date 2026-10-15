@@ -176,9 +176,8 @@ That downloads Wine, applies every patch in `patches/`, builds it against the mi
 SDK extension, and installs the result. It takes a while — most of it is Wine. Nothing
 else has to be installed: the runtime and the SDK carry the compilers and the libraries.
 
-The patches are `-p0` patches against Wine as upstream ships it. 01–20 are the
-[NZXT CAM on Linux](https://github.com/adds39939/nzxt_cam_linux) series, unchanged, on the
-same Wine 11.16; 21–26 are what Synapse needed on top. To build against a different Wine,
+The patches are `-p0` patches against Wine 11.16 as upstream ships it: 01–26 are what
+Synapse needs, and 27–30 cut how much memory it takes. To build against a different Wine,
 change the `url` and `sha256` in the manifest's `wine` module and put the same version in
 [`WINE_VERSION`](WINE_VERSION) — CI checks the two agree.
 

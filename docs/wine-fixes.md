@@ -22,19 +22,37 @@ Knowing this up front explains most of what follows.
   mapping and lighting engines, Razer's Game Manager service, per-device driver
   packages -- verifying every file's Authenticode signature before it writes it.
 
-## Patches 01-20: the NZXT CAM series
+## Patches 01-20: device enumeration, HID and USB
 
-Wine here is 11.16, the same base as [NZXT CAM on Linux][cam], and its twenty patches
-are carried unchanged. They are generic fixes -- device enumeration, HID interface
-properties, WinUSB, cfgmgr32 device nodes, named tray icon windows -- and their
-write-up is in that project's `docs/wine-fixes.md`.
+Wine here is 11.16. The first twenty patches fill gaps in the Windows device APIs that
+Electron applications use to find and talk to their hardware:
 
-The one Synapse visibly leans on is 07: `wineusb.sys` registering
-`GUID_DEVINTERFACE_USB_DEVICE`. App Engine's `rz-usb-detect` enumerates exactly that
-interface to learn which Razer devices are plugged in, and without it Synapse sees no
-USB devices at all. Patch 23 builds on the same driver.
+| Patch | What it does |
+| --- | --- |
+| 01 | `propsys` knows the HID property names (`System.DeviceInterface.Hid.*`) |
+| 02 | `DeviceWatcher` raises its `Updated` and `Removed` events |
+| 03 | `hidclass.sys` publishes each HID interface's usage page, usage and IDs as properties |
+| 04 | DevQuery applies the filters it is given |
+| 05 | DevQuery enumerates interface properties from both registry levels |
+| 06 | `IDeviceInformation2` is implemented |
+| 07 | `wineusb.sys` registers `GUID_DEVINTERFACE_USB_DEVICE` for every device |
+| 08 | `winusb.dll` is implemented, on top of `wineusb.sys` |
+| 09 | `SPDRP_PHYSICAL_DEVICE_OBJECT_NAME` is answered |
+| 10 | Overlapped WinUSB transfers complete instead of failing with `ERROR_IO_PENDING` |
+| 11 | `IReference<UINT16>` exists |
+| 12 | `System.Devices.Children` is a known property |
+| 13 | cfgmgr32 can query device nodes, not only interfaces |
+| 14 | `DeviceInformation.CreateFromIdAsync` is implemented |
+| 15 | Unnamed property keys are formatted in the case Windows uses |
+| 16 | `FindAllAsync` with a device information kind is implemented |
+| 17 | DevQuery string filters compare strings, not buffer sizes |
+| 18 | `wineusb.sys` reads MS OS descriptors and registers the interface GUIDs they name |
+| 19 | `Windows.Devices.Usb` is implemented |
+| 20 | Wine's tray icon windows are named after their application, so desktops can remember them |
 
-[cam]: https://github.com/adds39939/nzxt_cam_linux
+The one Synapse visibly leans on is 07. App Engine's `rz-usb-detect` enumerates exactly
+that interface to learn which Razer devices are plugged in, and without it Synapse sees
+no USB devices at all. Patch 23 builds on the same driver.
 
 ## Prefix settings
 
@@ -369,9 +387,21 @@ Every DLL App Engine ships (`libGLESv2.dll`, `ffmpeg.dll`, ...) was loaded the s
 **Fix:** patch 27 has the wineserver write those sections once into a temp file laid
 out the way the image is in memory, and hand it to every process mapping the image,
 which maps the sections from it copy-on-write. Their pages are then shared like any
-other file mapping. The copy is kept per file, next to the one Wine already keeps for
-shared PE sections, and lives as long as anything has the image mapped. Wine refuses
-to open a mapped image for writing, so it cannot go stale.
+other file mapping:
+
+```
+140001000-14ad87000 r-xp 00001000 103:07 205807475   /var/data/wineprefix/#205807475 (deleted)
+```
+
+The temp file is an unnamed file in the prefix directory (`O_TMPFILE`), not memory, so
+it behaves like any executable on disk: only the pages some process uses are in memory,
+and the kernel can drop those and read them back. A copy in memory would hold every
+page of every image, used or not -- 330 MB here, 95 MB of which nothing ever touched.
+Where the prefix's filesystem cannot make such a file, it is a memfd.
+
+The copy is kept per file, next to the one Wine already keeps for shared PE sections,
+and lives as long as anything has the image mapped. Wine refuses to open a mapped image
+for writing, so it cannot go stale.
 
 ### 28. Transparent huge pages, 2 MB at a time
 
@@ -387,15 +417,12 @@ first touch anywhere in a 2 MB-aligned stretch of a committed region brings in a
 2 MB page, and khugepaged goes on to collapse more of them for as long as Synapse runs.
 
 **Fix:** patch 28 has every Wine process opt out with `prctl(PR_SET_THP_DISABLE)`,
-which child processes and the wineserver inherit. Measured on NZXT CAM, which runs
-five Electron processes under the same Wine, it is worth about 70 MB on top of the
-other two patches; Synapse runs more processes than that.
+which child processes and the wineserver inherit.
 
 ### 29. A terabyte of reserved address space cost hundreds of MB per process
 
-**Symptom:** with those two fixed, NZXT CAM's renderer and main process -- the same
-Electron under the same Wine -- still had about 280 MB each resident that was entirely
-zero.
+**Symptom:** the background manager's renderer held a 268 MB block that was resident
+and entirely zero: 67,358 of its 67,361 pages.
 
 **Cause:** Wine keeps every page's protection in a table, one byte per 4 KB page of
 address space. V8 reserves its sandbox up front -- about 1.4 TB in each of App
@@ -406,27 +433,45 @@ They are zero, but writing them faults in up to 350 MB of table per process.
 (`madvise(MADV_DONTNEED)`) instead of writing them. They read back as zero without
 being resident until something is committed in that range.
 
+### 30. Direct3D buffers came in 64 MB pieces
+
+**Symptom:** App Engine's GPU process had 165 MB mapped from `/dev/nvidiactl`, 131 MB
+of it in two 64 MB mappings that were resident from end to end.
+
+**Cause:** Chromium draws through Direct3D 11, which Wine implements in wined3d on top
+of OpenGL. wined3d sub-allocates buffers out of 64 MB chunks, at least one for each
+kind of memory in use, and keeps each chunk mapped -- which NVIDIA's driver backs with
+pinned system memory. Windows that draw a few panels use a sliver of one.
+
+**Fix:** patch 30 makes the chunks 4 MB. The allocator keeps its 4 KB minimum block,
+so every allocation is aligned as before; a buffer over 2 MB gets memory of its own,
+as one over 32 MB did before.
+
 ### What it adds up to
 
 PSS of every process in the sandbox, from `/proc/<pid>/smaps_rollup`, with Synapse's
-window closed to the tray. The total also counts the part of the wineserver's
-shared copies (330 MB in all) that no process has mapped.
+window closed to the tray.
 
 | Process | Before | After |
 | --- | ---: | ---: |
-| Main | 822 MB | 252 MB |
-| GPU | 714 MB | 261 MB |
-| Network service | 244 MB | 25 MB |
-| Renderer: Game Manager proxy | 935 MB | 40 MB |
-| Renderer: tray menu | 666 MB | 57 MB |
-| Renderer: device page | 628 MB | 64 MB |
-| Renderer: background manager | 625 MB | 60 MB |
+| Main | 822 MB | 262 MB |
+| GPU | 714 MB | 208 MB |
+| Network service | 244 MB | 27 MB |
+| Renderer: Game Manager proxy | 935 MB | 45 MB |
+| Renderer: tray menu | 666 MB | 62 MB |
+| Renderer: device page | 628 MB | 73 MB |
+| Renderer: background manager | 625 MB | 67 MB |
 | Renderer: lighting engine | 621 MB | 60 MB |
-| Renderer: notifications | 606 MB | 48 MB |
-| **Total** | **5,991 MB** | **1,287 MB** |
+| Renderer: notifications | 606 MB | 47 MB |
+| **Total** | **5,991 MB** | **1,189 MB** |
 
 The second total includes two renderers the first run did not have open, Synapse's own
-page (177 MB) and its window (36 MB).
+page (181 MB) and its window (40 MB); App Engine closes the first of them some time after
+the window is closed.
+
+What is left of NVIDIA's driver in the GPU process is 38 MB mapped from
+`/dev/nvidiactl`, down from 165 MB. Its largest remaining allocation is 49 MB of pixel
+data in a Unix-side malloc arena, which grows with what the window drew while it was open.
 
 ## Things that are not fixed, and why
 

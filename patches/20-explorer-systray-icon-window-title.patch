@@ -27,7 +27,7 @@
 +    {
 +        for (file = path, p = path; *p; p++) if (*p == '\\' || *p == '/') file = p + 1;
 +        for (ext = NULL, p = file; *p; p++) if (*p == '.') ext = p;
-+        if (ext && ext != file) *ext = 0;   /* "NZXT CAM.exe" -> "NZXT CAM" */
++        if (ext && ext != file) *ext = 0;   /* "RazerAppEngine.exe" -> "RazerAppEngine" */
 +        lstrcpynW( name, file, len );
 +    }
 +    CloseHandle( process );
