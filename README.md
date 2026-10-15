@@ -177,7 +177,7 @@ SDK extension, and installs the result. It takes a while — most of it is Wine.
 else has to be installed: the runtime and the SDK carry the compilers and the libraries.
 
 The patches are `-p0` patches against Wine 11.16 as upstream ships it: 01–26 are what
-Synapse needs, and 27–29 cut how much memory it takes. To build against a different Wine,
+Synapse needs, and 27–30 cut how much memory it takes. To build against a different Wine,
 change the `url` and `sha256` in the manifest's `wine` module and put the same version in
 [`WINE_VERSION`](WINE_VERSION) — CI checks the two agree.
 
