@@ -9,8 +9,7 @@ user-mode DLLs, all under /app.
 These are NOT original works of this repository. They are compiled from the
 Wine source tree with the patches in patches/ applied, and are therefore
 derivative works of Wine, licensed under the GNU Lesser General Public License
-version 2.1 or later (LGPL-2.1-or-later). Patches 01-20 come from the NZXT CAM
-on Linux project (https://github.com/adds39939/nzxt_cam_linux) unchanged.
+version 2.1 or later (LGPL-2.1-or-later).
 
   Upstream source : https://dl.winehq.org/wine/source/
   Version         : see WINE_VERSION

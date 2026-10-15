@@ -58,9 +58,8 @@ finish-args:
   - --env=WINEPREFIX=/var/data/wineprefix
   # Gecko is Wine's Internet Explorer engine. Nothing here renders through it, and
   # without this Wine offers to download it in a dialog whenever it updates the prefix.
-  # Mono is NOT disabled here the way it is for NZXT CAM: the setup replaces it with the
-  # real .NET Framework, which Razer's installer needs, and an override on mscoree
-  # would switch that off too. The setup disables both for the one wineboot that
+  # Mono is NOT disabled here: the setup replaces it with the real .NET Framework,
+  # which Razer's installer needs, and an override on mscoree would switch that off too. The setup disables both for the one wineboot that
   # creates the prefix.
   - --env=WINEDLLOVERRIDES=mshtml=d
 
@@ -68,8 +67,7 @@ modules:
   - name: wine
     config-opts:
       # New WoW64: 32-bit PE files, 64-bit Unix side, and no 32-bit Unix libraries
-      # anywhere -- the same shape as the NZXT CAM build this one shares its base with.
-      # A pure --enable-win64 build leaves no C:\windows\syswow64, and winetricks
+      # anywhere. A pure --enable-win64 build leaves no C:\windows\syswow64, and winetricks
       # registers every font it installs with syswow64\regedit.exe.
       - --enable-archs=i386,x86_64
       - --disable-tests
@@ -92,9 +90,9 @@ modules:
       - type: archive
         url: https://dl.winehq.org/wine/source/11.x/wine-11.16.tar.xz
         sha256: c66e2090343dcd727f7f7fd2f87ee0bfb0b118790c1d745ab7b8a4c3a4197f2f
-      # What each patch fixes, and why, is in docs/wine-fixes.md. 01-20 are the NZXT CAM
-      # series, unchanged; 21-26 are the ones Synapse needed on top, and 27-29 cut how
-      # much memory it takes. They are -p0 patches, hence strip-components: 0.
+      # What each patch fixes, and why, is in docs/wine-fixes.md. 01-26 make Synapse work,
+      # and 27-29 cut how much memory it takes. They are -p0 patches, hence
+      # strip-components: 0.
       - type: patch
         path: ../patches/01-propsys-hid-properties.patch
         strip-components: 0

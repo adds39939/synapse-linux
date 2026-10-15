@@ -22,19 +22,37 @@ Knowing this up front explains most of what follows.
   mapping and lighting engines, Razer's Game Manager service, per-device driver
   packages -- verifying every file's Authenticode signature before it writes it.
 
-## Patches 01-20: the NZXT CAM series
+## Patches 01-20: device enumeration, HID and USB
 
-Wine here is 11.16, the same base as [NZXT CAM on Linux][cam], and its twenty patches
-are carried unchanged. They are generic fixes -- device enumeration, HID interface
-properties, WinUSB, cfgmgr32 device nodes, named tray icon windows -- and their
-write-up is in that project's `docs/wine-fixes.md`.
+Wine here is 11.16. The first twenty patches fill gaps in the Windows device APIs that
+Electron applications use to find and talk to their hardware:
 
-The one Synapse visibly leans on is 07: `wineusb.sys` registering
-`GUID_DEVINTERFACE_USB_DEVICE`. App Engine's `rz-usb-detect` enumerates exactly that
-interface to learn which Razer devices are plugged in, and without it Synapse sees no
-USB devices at all. Patch 23 builds on the same driver.
+| Patch | What it does |
+| --- | --- |
+| 01 | `propsys` knows the HID property names (`System.DeviceInterface.Hid.*`) |
+| 02 | `DeviceWatcher` raises its `Updated` and `Removed` events |
+| 03 | `hidclass.sys` publishes each HID interface's usage page, usage and IDs as properties |
+| 04 | DevQuery applies the filters it is given |
+| 05 | DevQuery enumerates interface properties from both registry levels |
+| 06 | `IDeviceInformation2` is implemented |
+| 07 | `wineusb.sys` registers `GUID_DEVINTERFACE_USB_DEVICE` for every device |
+| 08 | `winusb.dll` is implemented, on top of `wineusb.sys` |
+| 09 | `SPDRP_PHYSICAL_DEVICE_OBJECT_NAME` is answered |
+| 10 | Overlapped WinUSB transfers complete instead of failing with `ERROR_IO_PENDING` |
+| 11 | `IReference<UINT16>` exists |
+| 12 | `System.Devices.Children` is a known property |
+| 13 | cfgmgr32 can query device nodes, not only interfaces |
+| 14 | `DeviceInformation.CreateFromIdAsync` is implemented |
+| 15 | Unnamed property keys are formatted in the case Windows uses |
+| 16 | `FindAllAsync` with a device information kind is implemented |
+| 17 | DevQuery string filters compare strings, not buffer sizes |
+| 18 | `wineusb.sys` reads MS OS descriptors and registers the interface GUIDs they name |
+| 19 | `Windows.Devices.Usb` is implemented |
+| 20 | Wine's tray icon windows are named after their application, so desktops can remember them |
 
-[cam]: https://github.com/adds39939/nzxt_cam_linux
+The one Synapse visibly leans on is 07. App Engine's `rz-usb-detect` enumerates exactly
+that interface to learn which Razer devices are plugged in, and without it Synapse sees
+no USB devices at all. Patch 23 builds on the same driver.
 
 ## Prefix settings
 
@@ -387,15 +405,12 @@ first touch anywhere in a 2 MB-aligned stretch of a committed region brings in a
 2 MB page, and khugepaged goes on to collapse more of them for as long as Synapse runs.
 
 **Fix:** patch 28 has every Wine process opt out with `prctl(PR_SET_THP_DISABLE)`,
-which child processes and the wineserver inherit. Measured on NZXT CAM, which runs
-five Electron processes under the same Wine, it is worth about 70 MB on top of the
-other two patches; Synapse runs more processes than that.
+which child processes and the wineserver inherit.
 
 ### 29. A terabyte of reserved address space cost hundreds of MB per process
 
-**Symptom:** with those two fixed, NZXT CAM's renderer and main process -- the same
-Electron under the same Wine -- still had about 280 MB each resident that was entirely
-zero.
+**Symptom:** the background manager's renderer held a 268 MB block that was resident
+and entirely zero: 67,358 of its 67,361 pages.
 
 **Cause:** Wine keeps every page's protection in a table, one byte per 4 KB page of
 address space. V8 reserves its sandbox up front -- about 1.4 TB in each of App
