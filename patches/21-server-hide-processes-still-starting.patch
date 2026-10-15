@@ -1,0 +1,23 @@
+diff --git server/process.c server/process.c
+index 94adb19..ecb5b0a 100644
+--- server/process.c
++++ server/process.c
+@@ -1995,6 +1995,10 @@ DECL_HANDLER(list_processes)
+ 
+     LIST_FOR_EACH_ENTRY( process, &process_list, struct process, entry )
+     {
++        /* A process whose startup has not completed has no PEB yet. Windows never
++         * lists one in that state, and callers that walk the list and read each
++         * process's PEB fail on it, so leave it out until it has initialized. */
++        if (!is_process_init_done( process )) continue;
+         reply->info_size = (reply->info_size + 7) & ~7;
+         reply->info_size += sizeof(struct process_info) + process->imagelen;
+         reply->info_size = (reply->info_size + 7) & ~7;
+@@ -2017,6 +2021,7 @@ DECL_HANDLER(list_processes)
+     {
+         struct process_info *process_info;
+ 
++        if (!is_process_init_done( process )) continue;
+         pos = (pos + 7) & ~7;
+         process_info = (struct process_info *)(buffer + pos);
+         process_info->start_time = process->start_time;

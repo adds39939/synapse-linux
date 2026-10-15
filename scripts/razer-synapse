@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# Launch Razer Synapse in its patched Wine prefix.
+#
+#   razer-synapse            supervise Synapse
+#   razer-synapse --setup    (re)run the first-run install and exit
+#
+# Anything else is handed to Synapse -- the autostart entry passes the same arguments
+# Synapse puts in its own Run key, and razer-synapse:// links go through untouched.
+#
+# Wine lives in /app and is already patched, so this script only has to deal with
+# what changes at runtime: the display scale, device access, and keeping exactly one
+# copy of Synapse running against the prefix.
+set -uo pipefail
+
+export WINEPREFIX="${WINEPREFIX:-${XDG_DATA_HOME:-$HOME/.local/share}/wineprefix}"
+
+ENGINEDIR="$WINEPREFIX/drive_c/Program Files/Razer/RazerAppEngine"
+ENGINE="$ENGINEDIR/RazerAppEngine.exe"
+SYNAPSE_APP="$ENGINEDIR/Apps/Synapse"
+LOG="$WINEPREFIX/razer-synapse.log"
+LOCK="$WINEPREFIX/.razer-synapse.lock"
+# Touched by a second launch to ask the running one to show its window. See
+# request_raise() for why a second launch cannot do that itself.
+RAISE="$WINEPREFIX/.razer-synapse.raise"
+APPID="io.github.adds39939.SynapseLinux"
+
+args=()
+for a in "$@"; do
+  case "$a" in
+    -h|--help)   sed -n '2,8p' "$0" | cut -c3-; exit 0 ;;
+    --setup)     exec razer-synapse-setup ;;
+    *)           args+=("$a") ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+
+# What the installer itself launches Synapse with, and what its tray entry uses. A bare
+# razer-synapse:// link -- a sign-in coming back from the browser -- is handed over the
+# way Windows' registration for the scheme does it.
+case "${1:-}" in
+  "")                                      set -- --url-params=apps=synapse ;;
+  razer-synapse:*|razerappengine-synapse:*) set -- --url-params=apps=synapse "$@" ;;
+esac
+
+mkdir -p "$WINEPREFIX"
+
+# ----------------------------------------------------------------- one at a time
+
+# Only one launcher at a time. Probe the lock rather than take it, so that taking it
+# below is still possible.
+lock_held() {
+  ! ( { exec 9>"$LOCK"; } 2>/dev/null || exit 0; flock -n 9 ) 2>/dev/null
+}
+
+# Bringing the running copy to the front is normally a matter of starting it again:
+# Electron's single-instance lock hands the second one's arguments to the first and
+# exits, and unlike poking at the window that works from the tray, and on Wayland.
+#
+# It cannot be done from here. Every `flatpak run` is a fresh sandbox with its own PID
+# namespace and its own /tmp, and Wine's server socket lives in /tmp -- so a second
+# instance would not find the running wineserver, it would start a SECOND one against
+# the same prefix. Two wineservers on one prefix is how a prefix gets corrupted. Ask
+# the instance that owns the prefix to do it instead.
+request_raise() {
+  printf '%s\n' "$@" > "$RAISE" 2>/dev/null || return 1
+  return 0
+}
+
+if lock_held; then
+  if request_raise "$@"; then
+    echo "razer-synapse: already running -- asked it to show its window"
+  else
+    echo "razer-synapse: already running" >&2
+  fi
+  exit 0
+fi
+
+# Take it for real. Note the braces: "exec 9>file 2>/dev/null" would apply that second
+# redirection to the shell as well, and silently throw away every message from here on.
+locked=1
+if { exec 9>"$LOCK"; } 2>/dev/null; then
+  flock -n 9 || locked=0
+fi
+if [ "$locked" = 0 ]; then
+  # Lost the race with another launcher started at the same moment.
+  request_raise "$@"
+  echo "razer-synapse: already running" >&2
+  exit 0
+fi
+rm -f "$RAISE"
+
+# Everything from here writes to that log, so trim it before it grows without end.
+[ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ] && : > "$LOG"
+
+# Started from the application menu or at login there is no terminal for any of this
+# to go to, and Wine writes a fixme line for every stub it hits. Send it to the one
+# file the docs tell people to read.
+[ -t 1 ] || exec >>"$LOG" 2>&1
+
+# ------------------------------------------------------------------- first run
+
+# Synapse is not redistributed -- Razer's own installer is downloaded and run the
+# first time this starts.
+if [ ! -f "$ENGINE" ] || [ ! -d "$SYNAPSE_APP" ]; then
+  razer-synapse-setup || { echo "razer-synapse: setup did not finish -- see $LOG" >&2; exit 1; }
+fi
+[ -f "$ENGINE" ] || { echo "razer-synapse: Razer Synapse is not installed" >&2; exit 1; }
+
+# -------------------------------------------------------------- device access
+
+# Razer devices stay owned by root until a udev rule says otherwise, and no Flatpak can
+# install one. Without it Synapse starts and looks entirely normal while finding no
+# devices, which gives no hint at all where to look -- so say so, once, somewhere the
+# user will actually see it.
+#
+# Test the Razer device's own hidraw nodes, not just any of them: a keyboard or game
+# controller carries uaccess on most desktops, so asking whether some /dev/hidraw* is
+# readable would pass on every machine that had one.
+check_device_access() {
+  local dev node found=0 blocked=0
+  for dev in /sys/bus/hid/devices/*; do
+    case "${dev##*/}" in *:1532:*) ;; *) continue ;; esac
+    found=1
+    for node in "$dev"/hidraw/hidraw*; do
+      [ -e "$node" ] || continue
+      node="/dev/${node##*/}"
+      { [ -r "$node" ] && [ -w "$node" ]; } || blocked=1
+    done
+  done
+  [ "$found" = 1 ] || return 0          # no Razer device attached; nothing to say
+  [ "$blocked" = 1 ] || return 0        # its own nodes are reachable
+
+  # Not "cp /app/...": /app exists only inside the sandbox, and the shell the user runs
+  # sudo in does not have it. Pipe the rule out instead.
+  local cmd="flatpak run --command=razer-synapse-setup $APPID --udev-rule \\
+  | sudo tee /etc/udev/rules.d/60-razer-synapse.rules >/dev/null
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb"
+
+  echo "razer-synapse: a Razer device is attached but its /dev/hidraw* is not accessible." >&2
+  echo "razer-synapse: Synapse will start and find nothing. On the host, run:" >&2
+  printf 'razer-synapse:   %s\n' "$cmd" >&2
+
+  # A text-info dialog rather than a warning box: the text can be selected and copied,
+  # which matters when the whole point is to get four lines into a terminal.
+  if command -v zenity >/dev/null 2>&1 &&
+     { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then
+    printf '%s\n\n%s\n' \
+      "Razer Synapse cannot reach your device. Run this in a terminal, then restart Synapse:" \
+      "$cmd" |
+    zenity --text-info --title="Razer Synapse needs one step on the host" \
+           --width=720 --height=230 >/dev/null 2>&1 || true
+  else
+    notify-send -a "Razer Synapse" -u critical "Razer Synapse cannot reach your device" \
+      "A udev rule is needed. Run:  flatpak run --command=razer-synapse-setup $APPID --udev-help" \
+      2>/dev/null || true
+  fi
+}
+check_device_access
+
+# --------------------------------------------------------------- prefix settings
+
+# Each of these reads the registry first and only writes when something changed, so a
+# normal start costs a few `wine reg query` calls and never bounces the wineserver.
+
+reg_dword() {                   # reg_dword <key> <value>: print it as decimal, or nothing
+  wine reg query "$1" /v "$2" 2>/dev/null | awk -v v="$2" '$1 == v {print strtonum($NF)}'
+}
+
+# winebus leaves anything whose first collection is a mouse or a keyboard to the
+# windowing system and does not expose it as a HID device at all -- which is every
+# interface a Razer mouse has, so Synapse would find nothing to talk to. Wine's own
+# per-vendor switch turns that off for Razer's vendor id. Nothing in Wine turns HID
+# mouse reports into pointer movement (mouhid.sys only binds touchscreens), so this
+# adds no second cursor; it only lets the devices be opened. setup writes it too; this
+# is here so that a prefix from an older build, or one with the key deleted, recovers.
+WINEBUS_RAZER='HKLM\System\CurrentControlSet\Services\WineBus\Devices\1532'
+ensure_hidraw() {
+  [ "$(reg_dword "$WINEBUS_RAZER" Hidraw)" = 1 ] && return 0
+  echo "razer-synapse: enabling hidraw for Razer devices in winebus"
+  wine reg add "$WINEBUS_RAZER" /v Hidraw /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  # winebus reads its options once, as it starts.
+  wineserver -k >/dev/null 2>&1
+  wineserver -w
+}
+
+# ---------------------------------------------------------------------- scale
+
+# Synapse always renders at 100%, so on a scaled display it comes out small. The scale
+# goes in through Wine's DPI; razer-synapse-xdpi works out what it should be (the
+# desktop's Xft.dpi, as every XWayland client gets it) and writes it only if it changed.
+# The setup does the same before Razer's installer opens. Override it with:
+#   flatpak override --user --env=RAZER_SYNAPSE_SCALE=1.5 io.github.adds39939.SynapseLinux
+
+# ----------------------------------------------------------------- tray icon
+
+# Wine's explorer publishes Synapse's tray icon as an XEmbed window, which KDE proxies
+# into a StatusNotifierItem. On a Flatpak that produces a second entry, because Plasma
+# also lists the app under its Background Apps indicator. The two look alike and only
+# one of them has Synapse's menu on it.
+#
+# RAZER_SYNAPSE_TRAY=0 turns Wine's icon off, leaving Plasma's entry as the only one:
+#   flatpak override --user --env=RAZER_SYNAPSE_TRAY=0 io.github.adds39939.SynapseLinux
+#
+# Off by default: desktops other than KDE have no Background Apps indicator, and there
+# Wine's is the only tray icon there is.
+TRAY_POLICY='HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+apply_tray_policy() {
+  local want cur
+  want=0
+  [ "${RAZER_SYNAPSE_TRAY:-1}" = "0" ] && want=1
+  cur="$(reg_dword "$TRAY_POLICY" NoTrayItemsDisplay)"
+  [ "${cur:-0}" = "$want" ] && return 0
+  if [ "$want" = 1 ]; then
+    echo "razer-synapse: hiding Wine's tray icon (RAZER_SYNAPSE_TRAY=0)"
+    wine reg add "$TRAY_POLICY" /v NoTrayItemsDisplay /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  else
+    echo "razer-synapse: restoring Wine's tray icon"
+    wine reg delete "$TRAY_POLICY" /v NoTrayItemsDisplay /f >/dev/null 2>&1
+  fi
+  wineserver -w
+}
+
+# ------------------------------------------------------------------- shutdown
+
+# Nothing in the sandbox may outlive this script. bwrap is PID 1 in here and reaps
+# until the namespace is empty, not until its first child exits, so one straggler keeps
+# the whole sandbox on its feet -- and at logout that straggler is what the machine
+# waits for. Synapse leaves more of them than most: Razer's elevation and Game Manager
+# services run as Windows services and never exit on their own.
+#
+# kill(-1) is "every process this one may signal", which the kernel reads as all of
+# them bar PID 1 and the caller: exactly the sandbox and nothing outside it. That is
+# only true while there IS a sandbox, though. Run outside one -- from a checkout, on a
+# developer's machine -- the same call is the whole login session, so make sure of PID
+# 1 before reaching for it.
+reap_sandbox() {
+  [ "$(cat /proc/1/comm 2>/dev/null)" = bwrap ] || return 0
+  kill -TERM -1 2>/dev/null || return 0
+  for _ in 1 2 3 4; do
+    sleep 0.25
+    kill -0 -1 2>/dev/null || return 0
+  done
+  kill -KILL -1 2>/dev/null || true
+}
+
+cleanup() {
+  trap - EXIT INT TERM
+  [ -n "${raiser:-}" ] && kill "$raiser" 2>/dev/null
+  if [ -n "${engine:-}" ] && kill -0 "$engine" 2>/dev/null; then
+    kill "$engine" 2>/dev/null
+    for _ in 1 2 3 4 5; do kill -0 "$engine" 2>/dev/null || break; sleep 1; done
+  fi
+  # Bounded: a wineserver that has wedged must not become the thing holding up the
+  # shutdown, and reap_sandbox below settles it either way.
+  timeout 10 wineserver -k >/dev/null 2>&1 || true
+  rm -f "$RAISE"
+
+  # Once more on the way out, now that stopping the wineserver has flushed the
+  # registry: a "start with Windows" flipped during this session is on disk by now.
+  timeout 10 razer-synapse-autostart sync >/dev/null 2>&1 || true
+
+  # Last, and nothing after it -- it takes the rest of the sandbox with it.
+  reap_sandbox
+}
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------------- start
+
+# Synapse's own "start with Windows" switch writes to the prefix's Run key, which Wine
+# only acts on when a Wine session starts -- and nothing starts one when you log in to
+# Linux. Mirror the switch onto the Linux side, here and once more on the way out.
+razer-synapse-autostart sync >/dev/null 2>&1 || true
+
+# Answer the raise requests a second launch leaves behind. Runs in this sandbox, so it
+# reaches this instance's wineserver and App Engine's single-instance lock.
+raise_watcher() {
+  # Bash clears inherited traps in a background subshell, but say so anyway: cleanup
+  # ends in a kill(-1), and a second copy of it running in here would take the launcher
+  # down mid-shutdown.
+  trap - EXIT INT TERM
+  local req
+  while :; do
+    if [ -e "$RAISE" ]; then
+      mapfile -t req < "$RAISE" 2>/dev/null || req=()
+      rm -f "$RAISE"
+      [ "${#req[@]}" -gt 0 ] || req=(--url-params=apps=synapse)
+      ( cd "$ENGINEDIR" && timeout 30 wine RazerAppEngine.exe "${req[@]}" ) >/dev/null 2>&1 || true
+    fi
+    sleep 1
+  done
+}
+raise_watcher &
+raiser=$!
+
+ensure_hidraw
+razer-synapse-xdpi --apply || true
+apply_tray_policy
+
+# The RazerAppEngine.exe at the top of the install is only a stub: it starts the real
+# Electron process out of the newest app-<version> directory beside it and exits, which
+# is how App Engine updates itself. So the process to follow is not the one started
+# here, and it cannot be found by name either -- Wine rewrites each process's command
+# line to the Windows one only when that fits in the space the original took, and App
+# Engine's does not, so it shows as " --url-params=apps=synapse" and nothing more. What
+# does identify it is the image it has mapped: the main process is the one running
+# app-<version>\RazerAppEngine.exe without a --type= switch, which every one of
+# Chromium's helper processes carries.
+engine_running() {
+  local p
+  for p in /proc/[0-9]*; do
+    grep -qs 'RazerAppEngine/app-[^/]*/RazerAppEngine\.exe' "$p/maps" || continue
+    tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q -- '--type=' && continue
+    return 0
+  done
+  return 1
+}
+
+cd "$ENGINEDIR" || exit 1
+wine RazerAppEngine.exe "$@" &
+engine=$!
+wait "$engine" 2>/dev/null
+engine=""
+
+# Closing the window only sends Synapse to the tray, exactly as on Windows; quitting it
+# from the tray menu is what ends this. Give the stub's child a moment to appear before
+# deciding that it never did.
+for _ in $(seq 30); do engine_running && break; sleep 1; done
+while engine_running; do sleep 2; done

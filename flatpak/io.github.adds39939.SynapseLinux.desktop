@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Razer Synapse
+GenericName=Razer Device Configuration
+Comment=Configure Razer mice, keyboards and their lighting
+Exec=razer-synapse %u
+Icon=io.github.adds39939.SynapseLinux
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=Razer;Synapse;mouse;keyboard;RGB;Chroma;DPI;macro;
+# Synapse registers itself as the handler for these on Windows -- sign-ins that finish
+# in the browser come back through them. The launcher hands them over the same way.
+MimeType=x-scheme-handler/razer-synapse;x-scheme-handler/razerappengine-synapse;
+StartupWMClass=razerappengine.exe

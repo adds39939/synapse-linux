@@ -1,0 +1,97 @@
+# Publish a release from the Flatpak bundle build.yaml produced.
+#
+# This does not build anything itself. It calls build.yaml -- the same workflow every
+# pull request into main has to pass -- and publishes the artifact that came out of it,
+# so what ships is exactly what was tested rather than a second, separate build that
+# happens to have been run against the same commit.
+name: release
+
+on:
+  push:
+    branches: [main]
+    # A release carries a gigabyte of Wine, so don't cut one for a docs-only change.
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yaml
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -s synapse-linux.flatpak ] || { echo "no bundle came back from build" >&2; exit 1; }
+          ls -lh synapse-linux.flatpak
+
+          tag="v$(date -u +%Y.%m.%d)-${{ github.run_number }}"
+          wine_version="$(cat WINE_VERSION)"
+
+          {
+            echo "Install with:"
+            echo
+            echo '```bash'
+            echo "flatpak install --user synapse-linux.flatpak"
+            echo '```'
+            echo
+            echo "Then install the udev rule. This is the one step that needs root and"
+            echo "the one step you cannot skip: Razer devices stay owned by root until a"
+            echo "rule says otherwise, and no Flatpak can install one -- so without it"
+            echo "Synapse starts, looks entirely normal, and finds no devices."
+            echo
+            echo '```bash'
+            echo "flatpak run --command=razer-synapse-setup io.github.adds39939.SynapseLinux --udev-rule \\"
+            echo "  | sudo tee /etc/udev/rules.d/60-razer-synapse.rules >/dev/null"
+            echo "sudo udevadm control --reload-rules"
+            echo "sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb"
+            echo '```'
+            echo
+            echo "(OpenRGB ships a rule for Razer's vendor id already; if you use it,"
+            echo "this is done.)"
+            echo
+            echo "Then start it from your application menu, or with:"
+            echo
+            echo '```bash'
+            echo "flatpak run io.github.adds39939.SynapseLinux"
+            echo '```'
+            echo
+            echo "The first run sets up the bundled Wine prefix and starts Razer's own"
+            echo "installer, downloaded from Razer: install Synapse from it as you would"
+            echo "on Windows."
+            echo
+            echo "Remove it again with:"
+            echo
+            echo '```bash'
+            echo "flatpak uninstall --delete-data io.github.adds39939.SynapseLinux"
+            echo '```'
+            echo
+            echo "Bundles **wine-${wine_version}**, patched, built from ${{ github.sha }}."
+          } > release-notes.md
+
+          gh release create "$tag" synapse-linux.flatpak \
+            --title "$tag" \
+            --notes-file release-notes.md \
+            --latest

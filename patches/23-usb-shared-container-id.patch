@@ -1,0 +1,172 @@
+diff --git dlls/winebus.sys/bus_udev.c dlls/winebus.sys/bus_udev.c
+index 35c3721..6c9ff6a 100644
+--- dlls/winebus.sys/bus_udev.c
++++ dlls/winebus.sys/bus_udev.c
+@@ -1171,6 +1171,24 @@ static void get_device_subsystem_info(struct udev_device *dev, const char *subsy
+ 
+         if ((tmp = udev_device_get_sysattr_value(parent, "serial")))
+             ntdll_umbstowcs(tmp, strlen(tmp) + 1, desc->serialnumber, ARRAY_SIZE(desc->serialnumber));
++
++        /* devpath is the chain of hub ports, "3" or "1.4"; with the bus it names the
++         * socket the device is in, which is what libusb tells wineusb.sys too. */
++        if ((tmp = udev_device_get_sysattr_value(parent, "busnum")))
++        {
++            const char *path = udev_device_get_sysattr_value(parent, "devpath");
++            UINT busnum = strtoul(tmp, NULL, 10), depth = 0;
++            UINT8 ports[8];
++            char *end;
++
++            while (path && *path && depth < ARRAY_SIZE(ports))
++            {
++                ports[depth++] = strtoul(path, &end, 10);
++                if (*end != '.') break;
++                path = end + 1;
++            }
++            usb_container_id(&desc->container_id, desc->vid, desc->pid, busnum, ports, depth);
++        }
+     }
+ }
+ 
+diff --git dlls/winebus.sys/main.c dlls/winebus.sys/main.c
+index c5d4799..1515b66 100644
+--- dlls/winebus.sys/main.c
++++ dlls/winebus.sys/main.c
+@@ -377,6 +377,13 @@ static void make_unique_container_id(struct device_extension *device)
+     struct device_extension *ext;
+     LARGE_INTEGER ticks;
+ 
++    /* Interfaces of one USB device share its container, as they do on Windows. */
++    if (!IsEqualGUID(&device->desc.container_id, &GUID_NULL))
++    {
++        device->container_id = device->desc.container_id;
++        return;
++    }
++
+     LIST_FOR_EACH_ENTRY(ext, &device_list, struct device_extension, entry)
+         if (IsEqualGUID(&device->container_id, &ext->container_id)) break;
+     if (&ext->entry == &device_list && !IsEqualGUID(&device->container_id, &GUID_NULL)) return;
+diff --git dlls/winebus.sys/unixlib.h dlls/winebus.sys/unixlib.h
+index 06ad570..c1975b9 100644
+--- dlls/winebus.sys/unixlib.h
++++ dlls/winebus.sys/unixlib.h
+@@ -46,6 +46,7 @@ struct device_desc
+     WCHAR manufacturer[MAX_PATH];
+     WCHAR product[MAX_PATH];
+     WCHAR serialnumber[MAX_PATH];
++    GUID container_id; /* GUID_NULL when the backend cannot tell */
+ };
+ 
+ struct device_options
+@@ -157,6 +158,21 @@ enum unix_funcs
+     unix_funcs_count,
+ };
+ 
++/* The container of a physical USB device: one GUID for every device node Windows would
++ * group under it -- the device, its interfaces, and the HID collections on them. It is
++ * derived from where the device is plugged in, so it is the same on every run, and
++ * wineusb.sys derives the identical GUID from libusb. The two must stay in step. */
++static inline void usb_container_id(GUID *guid, UINT vid, UINT pid, UINT busnum,
++                                    const UINT8 *ports, UINT depth)
++{
++    UINT i;
++
++    guid->Data1 = (vid << 16) | (pid & 0xffff);
++    guid->Data2 = busnum;
++    guid->Data3 = 0x5500 | depth;
++    for (i = 0; i < ARRAY_SIZE(guid->Data4); i++) guid->Data4[i] = i < depth ? ports[i] : 0;
++}
++
+ static inline const char *debugstr_device_desc(struct device_desc *desc)
+ {
+     if (!desc) return "(null)";
+diff --git dlls/wineusb.sys/unixlib.c dlls/wineusb.sys/unixlib.c
+index 29fd539..8c0951e 100644
+--- dlls/wineusb.sys/unixlib.c
++++ dlls/wineusb.sys/unixlib.c
+@@ -193,8 +193,26 @@ static bool get_ms_os_interface_guid(libusb_device_handle *handle, uint8_t inter
+     return false;
+ }
+ 
++/* The container of a physical USB device: one GUID for every device node Windows would
++ * group under it -- the device, its interfaces, and the HID collections on them. It is
++ * derived from where the device is plugged in, so it is the same on every run, and
++ * winebus.sys derives the identical GUID from udev for the HID side. The two must stay
++ * in step. */
++static void usb_container_id(GUID *guid, UINT vid, UINT pid, UINT busnum,
++                             const UINT8 *ports, UINT depth)
++{
++    UINT i;
++
++    guid->Data1 = (vid << 16) | (pid & 0xffff);
++    guid->Data2 = busnum;
++    guid->Data3 = 0x5500 | depth;
++    for (i = 0; i < ARRAY_SIZE(guid->Data4); i++) guid->Data4[i] = i < depth ? ports[i] : 0;
++}
++
+ static void add_usb_device(libusb_device *libusb_device)
+ {
++    uint8_t ports[8];
++    int depth;
+     struct libusb_config_descriptor *config_desc;
+     struct libusb_device_descriptor device_desc;
+     struct unix_device *unix_device;
+@@ -232,6 +250,9 @@ static void add_usb_device(libusb_device *libusb_device)
+     usb_event.u.added_device.protocol = device_desc.bDeviceProtocol;
+     usb_event.u.added_device.busnum = libusb_get_bus_number(libusb_device);
+     usb_event.u.added_device.portnum = libusb_get_port_number(libusb_device);
++    if ((depth = libusb_get_port_numbers(libusb_device, ports, ARRAY_SIZE(ports))) < 0) depth = 0;
++    usb_container_id(&usb_event.u.added_device.container_id, device_desc.idVendor, device_desc.idProduct,
++            usb_event.u.added_device.busnum, ports, depth);
+     usb_event.u.added_device.interface = false;
+     usb_event.u.added_device.interface_index = -1;
+     usb_event.u.added_device.has_iface_guid =
+diff --git dlls/wineusb.sys/unixlib.h dlls/wineusb.sys/unixlib.h
+index 6536abf..7cd5e59 100644
+--- dlls/wineusb.sys/unixlib.h
++++ dlls/wineusb.sys/unixlib.h
+@@ -49,6 +49,8 @@ struct usb_event
+             /* Device interface GUID advertised through MS OS descriptors, if any. */
+             bool has_iface_guid;
+             GUID iface_guid;
++            /* Shared by the device and its interfaces; see usb_container_id(). */
++            GUID container_id;
+         } added_device;
+         struct unix_device *removed_device;
+         IRP *completed_irp;
+diff --git dlls/wineusb.sys/wineusb.c dlls/wineusb.sys/wineusb.c
+index fb12d4f..8e34270 100644
+--- dlls/wineusb.sys/wineusb.c
++++ dlls/wineusb.sys/wineusb.c
+@@ -89,6 +89,7 @@ struct usb_device
+     int16_t interface_index;
+ 
+     uint8_t class, subclass, protocol, busnum, portnum;
++    GUID container_id;
+ 
+     uint16_t vendor, product, revision, usbver;
+ 
+@@ -153,6 +154,7 @@ static void add_unix_device(const struct usb_add_device_event *event)
+     device->protocol = event->protocol;
+     device->busnum = event->busnum;
+     device->portnum = event->portnum;
++    device->container_id = event->container_id;
+ 
+     device->vendor = event->vendor;
+     device->product = event->product;
+@@ -482,6 +484,16 @@ static NTSTATUS query_id(struct usb_device *device, IRP *irp, BUS_QUERY_ID_TYPE
+             get_compatible_ids(device, &buffer);
+             break;
+ 
++        case BusQueryContainerID:
++        {
++            const GUID *guid = &device->container_id;
++
++            append_id(&buffer, L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
++                    guid->Data1, guid->Data2, guid->Data3, guid->Data4[0], guid->Data4[1], guid->Data4[2],
++                    guid->Data4[3], guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
++            break;
++        }
++
+         default:
+             FIXME("Unhandled ID query type %#x.\n", type);
+             return irp->IoStatus.Status;

@@ -1,0 +1,205 @@
+# Build the Flatpak, and the single-file bundle around it.
+#
+# Everything this project ships is built here from source: Wine with the patches
+# applied, and the scripts around it. That is also what makes the LGPL side of it honest
+# -- the manifest plus patches/ IS the corresponding source for the Wine binaries in the
+# bundle.
+#
+# This runs on every pull request into main, so a patch that no longer applies, or a
+# manifest that has drifted from the patch series, is caught while it is still a pull
+# request. release.yaml calls this same workflow and publishes the artifact it produced,
+# so what ships is exactly what was tested.
+name: build
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+    outputs:
+      artifact:
+        description: Name of the artifact holding the Flatpak bundle
+        value: ${{ jobs.build.outputs.artifact }}
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APPID: io.github.adds39939.SynapseLinux
+  MANIFEST: flatpak/io.github.adds39939.SynapseLinux.yml
+  RUNTIME_VERSION: '25.08'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact: ${{ steps.pack.outputs.name }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Nearly all of this repo is shell, and a syntax error in it survives review far
+      # too easily. Cheap to rule out before spending an hour building Wine.
+      - name: Check the scripts parse
+        run: |
+          rc=0
+          for f in scripts/*; do
+            head -1 "$f" | grep -q 'bin/env bash' || continue
+            if bash -n "$f" 2>/dev/null; then
+              printf '  ok      %s\n' "$f"
+            else
+              printf '  SYNTAX  %s\n' "$f"; bash -n "$f" || true; rc=1
+            fi
+          done
+          python3 -m py_compile scripts/razer-synapse-xdpi && printf '  ok      %s\n' scripts/razer-synapse-xdpi || rc=1
+          [ "$rc" -eq 0 ] || { echo "syntax errors above" >&2; exit 1; }
+
+      # The manifest names each patch by hand. Adding one to patches/ and forgetting to
+      # list it would build a Wine missing that fix, and nothing downstream would say so
+      # -- Synapse would simply find no device. Check both directions.
+      - name: Check the manifest matches the patch series
+        run: |
+          listed="$(grep -oP '(?<=path: \.\./)patches/\S+' "$MANIFEST" | sort)"
+          onDisk="$(ls patches/*.patch | sort)"
+          if [ "$listed" != "$onDisk" ]; then
+            echo "the manifest and patches/ disagree:" >&2
+            diff <(echo "$listed") <(echo "$onDisk") || true
+            exit 1
+          fi
+          printf '  ok      %d patches, all listed\n' "$(echo "$onDisk" | wc -l)"
+
+          # WINE_VERSION is what the docs quote; the manifest is what actually gets
+          # built. They must not drift.
+          want="$(cat WINE_VERSION)"
+          grep -q "wine-${want}.tar.xz" "$MANIFEST" || {
+            echo "WINE_VERSION says $want but the manifest builds something else" >&2
+            grep -n 'dl.winehq.org' "$MANIFEST" >&2
+            exit 1; }
+          printf '  ok      manifest builds wine-%s\n' "$want"
+
+          # Without --allow=multiarch the sandbox refuses to start any 32-bit process,
+          # and the .NET Framework installer Razer's installer needs is one.
+          grep -q -- '--allow=multiarch' "$MANIFEST" || {
+            echo "the manifest has no --allow=multiarch; WoW64 will not work" >&2
+            exit 1; }
+          printf '  ok      --allow=multiarch is set (WoW64 needs it)\n'
+
+          # mscoree is the .NET Framework's loader. An override that disables it for the
+          # whole app would switch off the framework Razer's installer runs on.
+          if grep -E -- '--env=WINEDLLOVERRIDES=.*mscoree' "$MANIFEST"; then
+            echo "the manifest disables mscoree; Razer's installer needs .NET" >&2
+            exit 1
+          fi
+          printf '  ok      .NET is left enabled\n'
+
+      - name: Check the desktop entry and AppStream data
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends desktop-file-utils appstream
+          desktop-file-validate flatpak/$APPID.desktop
+          appstreamcli validate --no-net --explain flatpak/$APPID.metainfo.xml
+
+      - name: Install flatpak and the runtimes
+        run: |
+          # elfutils is not a dependency of Ubuntu's flatpak-builder, but flatpak-builder
+          # strips debug info out of every ELF it installs with eu-strip.
+          sudo apt-get install -y --no-install-recommends \
+            flatpak flatpak-builder ccache elfutils
+          flatpak remote-add --if-not-exists --user \
+            flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install -y --user --noninteractive flathub \
+            org.freedesktop.Platform//$RUNTIME_VERSION \
+            org.freedesktop.Sdk//$RUNTIME_VERSION \
+            org.freedesktop.Sdk.Extension.mingw-w64//$RUNTIME_VERSION
+
+      # Wine is most of the hour this takes. restore/save rather than actions/cache,
+      # which only saves in a post step that is skipped when the job fails.
+      - name: Restore the build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .flatpak-builder/ccache
+            .flatpak-builder/downloads
+          key: flatpak-${{ runner.os }}-${{ hashFiles('flatpak/*.yml', 'patches/*.patch') }}
+          restore-keys: flatpak-${{ runner.os }}-
+
+      - name: Build
+        run: |
+          flatpak-builder --user --disable-rofiles-fuse --ccache \
+            --repo=repo --force-clean build-dir "$MANIFEST"
+
+      - name: Save the build cache
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .flatpak-builder/ccache
+            .flatpak-builder/downloads
+          key: flatpak-${{ runner.os }}-${{ hashFiles('flatpak/*.yml', 'patches/*.patch') }}
+
+      # Most of the manifest's mistakes are silent ones: a script that did not get
+      # installed, a patched driver that did not end up where Wine maps it from. Look
+      # inside the finished build rather than trust that it exited zero.
+      - name: Check the build contains what it must
+        run: |
+          rc=0
+          check() {                       # check <path> <what it is>
+            if [ -s "build-dir/files/$1" ]; then printf '  ok      %s\n' "$1"
+            else printf '  MISSING %s  (%s)\n' "$1" "$2"; rc=1; fi
+          }
+          # The patched kernel drivers, in the one place Wine maps them from.
+          check lib/wine/x86_64-windows/hidclass.sys "HID interface properties"
+          check lib/wine/x86_64-windows/winebus.sys  "shared container IDs"
+          check lib/wine/x86_64-windows/wineusb.sys  "USB device interface, container IDs"
+          check lib/wine/x86_64-unix/wineusb.so      "the libusb half of wineusb"
+          check lib/wine/x86_64-unix/winebus.so      "the udev half of winebus"
+          check lib/wine/x86_64-unix/winex11.so      "empty windows stay empty"
+          # Patched user-mode DLLs, as Wine's own builtins.
+          for d in wintrust setupapi cfgmgr32 propsys winusb; do
+            check "lib/wine/x86_64-windows/$d.dll" "patched builtin"
+          done
+          check bin/wineserver                       "hides processes still starting"
+          check bin/razer-synapse                    "launcher"
+          check bin/razer-synapse-setup              "first-run install"
+          check bin/razer-synapse-autostart          "start on login"
+          check bin/razer-synapse-xdpi               "display scaling"
+          check share/razer-synapse/60-razer-synapse.rules "the udev rule to hand the user"
+          check bin/wine                             "Wine itself"
+          check bin/winetricks                       "fonts and .NET on first run"
+          check bin/cabextract                       "what winetricks unpacks with"
+          # The 32-bit PE half: .NET's installer is a 32-bit program, and winetricks
+          # registers fonts with syswow64\regedit.exe.
+          check lib/wine/i386-windows/regedit.exe    "syswow64"
+          check lib/wine/i386-windows/ntdll.dll      "the 32-bit PE half"
+          [ "$rc" -eq 0 ] || { echo "the build is incomplete" >&2; exit 1; }
+
+          # A patched DLL that silently fell back to the stock one would pass every check
+          # above. Look for something only the patches introduce.
+          if ! strings build-dir/files/lib/wine/x86_64-windows/wintrust.dll \
+               | grep -q '^AppxSipIsFileSupported$'; then
+            echo "wintrust.dll does not carry the AppX SIP" >&2
+            exit 1
+          fi
+          echo "  ok      wintrust.dll carries the AppX SIP"
+          if ! strings -el build-dir/files/lib/wine/x86_64-windows/propsys.dll \
+               | grep -q 'System.DeviceInterface.Hid.UsagePage'; then
+            echo "propsys.dll does not contain the patched HID property names" >&2
+            exit 1
+          fi
+          echo "  ok      propsys.dll carries the patched HID properties"
+
+      - name: Build the bundle
+        id: pack
+        run: |
+          flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
+            repo synapse-linux.flatpak "$APPID"
+          ls -lh synapse-linux.flatpak
+          echo "name=synapse-linux" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: synapse-linux
+          path: synapse-linux.flatpak
+          if-no-files-found: error
+          retention-days: 7

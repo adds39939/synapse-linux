@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# First run: build the prefix and run Razer's own installer in it.
+#
+#   razer-synapse-setup              install Synapse if it is not there yet
+#   razer-synapse-setup --reinstall  download and run Razer's installer again
+#   razer-synapse-setup --udev-help  explain the udev rule the host needs, and stop
+#   razer-synapse-setup --udev-rule  print just the rule, for piping into sudo tee
+#
+# The launcher calls this by itself the first time it runs, so this exists as a
+# separate command mainly for repairing an install:
+#   flatpak run --command=razer-synapse-setup io.github.adds39939.SynapseLinux --reinstall
+#
+# What it does to the prefix is what Synapse needs from a Windows install and Wine does
+# not have on its own: real fonts, .NET Framework 4.8 for Razer's installer, and a
+# Windows version Razer will serve Synapse 4 to. Everything after that is Razer's own
+# installer, run as it would be on Windows, fetching the current Synapse from Razer.
+set -uo pipefail
+
+# Razer's own link for the Synapse download, which is what razer.com/synapse-4 points
+# at. It always serves the current installer, which in turn always installs the
+# current Synapse -- nothing here pins a version.
+SYNAPSE_URL="${SYNAPSE_URL:-https://rzr.to/synapse-4-pc-download}"
+export WINEPREFIX="${WINEPREFIX:-${XDG_DATA_HOME:-$HOME/.local/share}/wineprefix}"
+ENGINEDIR="$WINEPREFIX/drive_c/Program Files/Razer/RazerAppEngine"
+SYNAPSE_APP="$ENGINEDIR/Apps/Synapse"
+SHARE="${RAZER_SYNAPSE_SHARE:-/app/share/razer-synapse}"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/razer-synapse"
+APPID="io.github.adds39939.SynapseLinux"
+
+say() { printf '\n==> %s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; step_done; exit 1; }
+
+# The commands below name the rule by piping it out of the sandbox, not by copying it
+# out of /app: /app exists only in here, and the shell the user runs sudo in is on the
+# host, where that path is nothing at all.
+udev_help() {
+    cat <<HELP
+Razer devices stay owned by root until a udev rule says otherwise, and Wine cannot open
+one without it -- Synapse runs, and finds no devices. A Flatpak cannot install the rule
+for you, so this is the one step that needs root on the host.
+
+Run this in a terminal on the host:
+
+  flatpak run --command=razer-synapse-setup $APPID --udev-rule \\
+    | sudo tee /etc/udev/rules.d/60-razer-synapse.rules >/dev/null
+  sudo udevadm control --reload-rules
+  sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb
+
+The rule itself is two lines, and is also in the repository at udev/60-razer-synapse.rules:
+
+$(sed 's/^/  /' "$SHARE/60-razer-synapse.rules" 2>/dev/null | grep -v '^  #' | grep -v '^  $')
+
+Anything that already ships a rule for Razer's vendor id has covered this -- OpenRGB
+does, and OpenRazer does for the devices it supports -- which is why the problem does
+not show up on every machine.
+HELP
+}
+
+REINSTALL=0
+for a in "$@"; do
+    case "$a" in
+        --udev-help) udev_help; exit 0 ;;
+        --udev-rule) cat "$SHARE/60-razer-synapse.rules"; exit 0 ;;
+        --reinstall) REINSTALL=1 ;;
+        *) echo "usage: $(basename "$0") [--reinstall|--udev-help|--udev-rule]" >&2; exit 1 ;;
+    esac
+done
+
+if [ -d "$SYNAPSE_APP" ] && [ "$REINSTALL" = 0 ]; then
+    say "Razer Synapse is already installed in $WINEPREFIX"
+    exit 0
+fi
+
+# ---------------------------------------------------------------- progress UI
+
+# This runs before there is any window to look at and takes several minutes, so say
+# what is happening. zenity is in the runtime; when there is no display to put it on
+# (a --command= run from a terminal) the messages just go to stdout.
+PROGRESS_FIFO=""
+progress_pid=""
+step_start() {
+    command -v zenity >/dev/null 2>&1 || return 0
+    { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; } || return 0
+    PROGRESS_FIFO="$(mktemp -u)"
+    mkfifo "$PROGRESS_FIFO" 2>/dev/null || { PROGRESS_FIFO=""; return 0; }
+    zenity --progress --pulsate --auto-close --no-cancel \
+           --title="Razer Synapse" --width=440 \
+           --text="Setting up Razer Synapse..." < "$PROGRESS_FIFO" >/dev/null 2>&1 &
+    progress_pid=$!
+    # Read-write, not write-only: opening a FIFO write-only blocks until a reader
+    # arrives, so a zenity that failed to start would hang the install here.
+    exec 8<>"$PROGRESS_FIFO"
+}
+step() {
+    say "$*"
+    [ -n "$PROGRESS_FIFO" ] && printf '# %s\n' "$*" >&8 2>/dev/null
+    return 0
+}
+step_done() {
+    [ -n "$PROGRESS_FIFO" ] || return 0
+    printf '100\n' >&8 2>/dev/null
+    exec 8>&- 2>/dev/null
+    rm -f "$PROGRESS_FIFO"
+    PROGRESS_FIFO=""
+    if [ -n "$progress_pid" ]; then
+        sleep 1
+        kill "$progress_pid" 2>/dev/null
+        wait "$progress_pid" 2>/dev/null
+        progress_pid=""
+    fi
+    return 0
+}
+trap 'step_done' EXIT
+
+# Let Wine finish what it is doing, but never wait indefinitely: "wineserver -w" waits
+# for every process in the prefix to exit, so anything holding a window open blocks it
+# for good. Give it a moment, then stop it.
+settle() { timeout 60 wineserver -w 2>/dev/null || wineserver -k >/dev/null 2>&1 || true; }
+
+step_start
+
+# ----------------------------------------------------------------- the prefix
+
+step "Creating the Wine prefix"
+mkdir -p "$WINEPREFIX"
+# Wine offers to download its own Mono and Gecko whenever it builds a prefix without
+# them. Neither is wanted: real .NET goes in below, and nothing here renders through
+# mshtml. Turning both off for this one command is what stops the dialogs; leaving
+# mscoree off any longer would switch off the .NET that the installer needs.
+WINEDLLOVERRIDES="mscoree,mshtml=d" WINEARCH=win64 wineboot -i >/dev/null 2>&1 || true
+settle
+
+# --- Without real fonts Chromium renders zero-height text and the renderer dies on a
+# --- NOTREACHED; Synapse is Chromium, so this is not cosmetic.
+#
+# Downloaded rather than bundled: Microsoft's licence allows redistributing these in
+# their original .exe form only, so they cannot ship inside the Flatpak.
+if [ ! -f "$WINEPREFIX/drive_c/windows/Fonts/arial.ttf" ]; then
+    step "Installing Microsoft's core fonts"
+    # Not silenced: when this fails, winetricks says why, and the launcher sends all of
+    # this to the prefix log.
+    winetricks -q corefonts ||
+        die "could not install corefonts -- see the output above, then try --reinstall"
+    [ -f "$WINEPREFIX/drive_c/windows/Fonts/arial.ttf" ] ||
+        die "corefonts did not install; Synapse would start to a blank window"
+    settle
+fi
+
+# Razer's installer is a .NET Framework 4.8 WPF application. Wine Mono runs some of
+# that, but not this; the real framework, downloaded from Microsoft, runs all of it.
+dotnet_release() {
+    wine reg query 'HKLM\Software\Microsoft\NET Framework Setup\NDP\v4\Full' /v Release 2>/dev/null |
+        awk '$1 == "Release" {print strtonum($NF)}'
+}
+if [ "$(dotnet_release)" -lt 528040 ] 2>/dev/null || [ -z "$(dotnet_release)" ]; then
+    step "Installing .NET Framework 4.8 for Razer's installer (several minutes)"
+    winetricks -q dotnet48 ||
+        die "could not install .NET Framework 4.8 -- see the output above, then try --reinstall"
+    settle
+    [ "$(dotnet_release)" -ge 528040 ] 2>/dev/null ||
+        die ".NET Framework 4.8 did not install; Razer's installer cannot run without it"
+fi
+
+# winetricks installs .NET with the prefix set to Windows 7 and leaves it there. Razer
+# serves Synapse 4 to Windows 10 and later only: asked as Windows 7, its manifest server
+# answers with an empty list, and the installer can only report "server access
+# unavailable", which sends you looking at the network rather than at this.
+step "Setting the prefix to Windows 10"
+winetricks -q win10 >/dev/null 2>&1 || wine winecfg /v win10 >/dev/null 2>&1 || true
+settle
+
+# winebus leaves every device whose first collection is a mouse or a keyboard to the
+# windowing system -- which is every interface a Razer mouse has -- so it has to be told
+# to expose Razer's. See the launcher's ensure_hidraw() for why that is safe.
+wine reg add 'HKLM\System\CurrentControlSet\Services\WineBus\Devices\1532' \
+    /v Hidraw /t REG_DWORD /d 1 /f >/dev/null 2>&1
+settle
+
+# Scale now, before the installer opens, so it comes up at the desktop's size too.
+razer-synapse-xdpi --apply || true
+
+# -------------------------------------------------------------- the installer
+
+mkdir -p "$CACHE"
+INSTALLER="$CACHE/RazerSynapseInstaller.exe"
+
+step "Downloading Razer's installer from razer.com"
+curl -fL --retry 3 -o "$INSTALLER.part" "$SYNAPSE_URL" || die "download failed: $SYNAPSE_URL"
+[ -s "$INSTALLER.part" ] || die "downloaded installer is empty"
+case "$(head -c2 "$INSTALLER.part")" in
+    MZ) ;;
+    *)  rm -f "$INSTALLER.part"; die "that is not a Windows executable -- did Razer's link change?" ;;
+esac
+mv -f "$INSTALLER.part" "$INSTALLER"
+
+# The progress dialog would sit on top of Razer's installer, which needs clicking
+# through -- take it down first.
+step "Starting Razer's installer -- choose Install, as on Windows"
+step_done
+notify-send -a "Razer Synapse" "Razer's installer is starting" \
+    "Install Razer Synapse from it as you would on Windows. Synapse opens when it is done." \
+    2>/dev/null || true
+
+# Razer's installer is a self-extractor that unpacks the real one into C:\windows and
+# exits straight away, so its exit says nothing. What says it is done is the result:
+# Synapse's files on disk, and App Engine started -- the installer launches Synapse as
+# its last act. Watch for that, and for the installer going away without it, which is
+# someone closing it before installing anything.
+wine "$INSTALLER" >/dev/null 2>&1 &
+
+# Both found by the image they have mapped rather than by name: Wine rewrites a
+# process's command line to the Windows one only when it fits, and these do not always.
+# See the launcher for the long version.
+installer_running() {
+    local p
+    for p in /proc/[0-9]*; do
+        grep -qsE '/(RazerInstaller|RazerSynapseInstaller)\.exe$' "$p/maps" && return 0
+    done
+    return 1
+}
+engine_running() {
+    local p
+    for p in /proc/[0-9]*; do
+        grep -qs 'RazerAppEngine/app-[^/]*/RazerAppEngine\.exe' "$p/maps" || continue
+        tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q -- '--type=' && continue
+        return 0
+    done
+    return 1
+}
+
+seen=0
+waited=0
+while [ "$waited" -lt 7200 ]; do       # it waits on a person; give them two hours
+    if [ -d "$SYNAPSE_APP" ] && engine_running; then
+        break
+    fi
+    if installer_running; then
+        seen=1
+    elif [ "$seen" = 1 ] || [ "$waited" -ge 120 ]; then
+        # Gone, or never appeared at all.
+        [ -d "$SYNAPSE_APP" ] && break
+        die "Razer's installer closed before Synapse was installed -- run Razer Synapse again to retry"
+    fi
+    sleep 2
+    waited=$((waited + 2))
+done
+[ -d "$SYNAPSE_APP" ] || die "Synapse did not install into $ENGINEDIR"
+
+say "Done -- Razer Synapse is installed"

@@ -1,0 +1,16 @@
+# Razer devices -- grant the logged-in seat user access, so Wine's winebus can
+# enumerate them and hand them to Razer Synapse. Installed by synapse-linux.
+#
+# Without this the devices stay owned by root, and Synapse starts, looks entirely
+# normal, and finds no devices. A Flatpak cannot install a udev rule, so this is the
+# one step that needs root on the host:
+#
+#   sudo cp 60-razer-synapse.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb
+#
+# Anything that already ships a rule for Razer's vendor id has covered this (OpenRGB
+# does, and OpenRazer covers the devices it supports), which is why the problem does
+# not show up on every machine.
+KERNEL=="hidraw*", ATTRS{idVendor}=="1532", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1532", MODE="0660", TAG+="uaccess"

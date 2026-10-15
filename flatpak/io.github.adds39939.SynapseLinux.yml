@@ -1,0 +1,221 @@
+# Razer Synapse on Linux, as a Flatpak.
+#
+# /app IS the Wine install directory. The patched kernel drivers (hidclass.sys,
+# winebus.sys, wineusb.sys) cannot be applied per prefix -- Wine treats the .sys inside
+# a prefix as a marker that the driver exists and maps the bytes from its own install
+# directory, by name -- so they are simply what `make install` put in
+# /app/lib/wine/x86_64-windows, and the patched user-mode DLLs are Wine's own builtins.
+# There is one Wine version, pinned and shipped, and nothing on the host is needed to
+# build or run it -- no wine, no winetricks, no cabextract, and no root.
+#
+# Build it with:
+#   flatpak install -y flathub org.freedesktop.Platform//25.08 \
+#       org.freedesktop.Sdk//25.08 org.freedesktop.Sdk.Extension.mingw-w64//25.08
+#   flatpak-builder --user --install --force-clean build-dir flatpak/io.github.adds39939.SynapseLinux.yml
+#
+# Wine is LGPL-2.1-or-later; this manifest plus patches/ is its corresponding source.
+# Razer Synapse itself is not redistributed -- Razer's installer is downloaded on first run.
+id: io.github.adds39939.SynapseLinux
+runtime: org.freedesktop.Platform
+runtime-version: &runtime-version '25.08'
+sdk: org.freedesktop.Sdk
+command: razer-synapse
+
+# The PE side of Wine needs a mingw-w64 cross compiler. Flathub publishes one as an SDK
+# extension, so nothing has to be bootstrapped here.
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.mingw-w64
+
+build-options:
+  append-path: /usr/lib/sdk/mingw-w64/bin
+
+finish-args:
+  # Synapse is an Electron app under Wine, and Wine's system tray is XEmbed over X11.
+  - --socket=x11
+  - --socket=wayland
+  - --share=ipc
+  # Razer devices are reached through /dev/hidraw*, and wineusb enumerates /dev/bus/usb
+  # to give them their USB identity. --device=all is the only permission that covers
+  # hidraw; there is no narrower one.
+  - --device=all
+  # Razer's installer, the Synapse it downloads, the device pages Synapse loads from
+  # apps.razer.com, and winetricks fetching fonts and .NET.
+  - --share=network
+  # Start on login is an autostart entry written here. See scripts/razer-synapse-autostart
+  # for why the Background portal is not used for it.
+  - --filesystem=xdg-config/autostart:create
+  # notify-send, for the first run and for telling the user when the udev rule is
+  # missing -- the one failure that otherwise looks like Synapse working perfectly and
+  # finding no devices.
+  - --talk-name=org.freedesktop.Notifications
+  # Wine wants ptrace for its own processes. Flathub's own Wine sets this.
+  - --allow=devel
+  # Without this the sandbox's seccomp filter refuses to start a 32-bit process, and
+  # Wine's WoW64 half is dead weight: wineboot never runs the inf's Wow64Install section,
+  # C:\windows\syswow64 stays empty, winetricks cannot register a single font, and the
+  # .NET Framework installer -- a 32-bit program -- cannot start at all.
+  - --allow=multiarch
+  - --env=WINEPREFIX=/var/data/wineprefix
+  # Gecko is Wine's Internet Explorer engine. Nothing here renders through it, and
+  # without this Wine offers to download it in a dialog whenever it updates the prefix.
+  # Mono is NOT disabled here the way it is for NZXT CAM: the setup replaces it with the
+  # real .NET Framework, which Razer's installer needs, and an override on mscoree
+  # would switch that off too. The setup disables both for the one wineboot that
+  # creates the prefix.
+  - --env=WINEDLLOVERRIDES=mshtml=d
+
+modules:
+  - name: wine
+    config-opts:
+      # New WoW64: 32-bit PE files, 64-bit Unix side, and no 32-bit Unix libraries
+      # anywhere -- the same shape as the NZXT CAM build this one shares its base with.
+      # A pure --enable-win64 build leaves no C:\windows\syswow64, and winetricks
+      # registers every font it installs with syswow64\regedit.exe.
+      - --enable-archs=i386,x86_64
+      - --disable-tests
+      # Wine's menu builder writes .desktop files and icons for everything a Windows
+      # installer asks for, which inside the sandbox go nowhere useful.
+      - --disable-winemenubuilder
+      # No value: configure then looks up <cpu>-w64-mingw32-gcc for each arch above.
+      - --with-mingw
+      # The SDK's OpenCL headers are too new for dlls/opencl, and nothing here uses it.
+      - --without-opencl
+    make-install-args:
+      - LDCONFIG=/bin/true
+      - UPDATE_DESKTOP_DATABASE=/bin/true
+      - INSTALL_PROGRAM_FLAGS=-s
+    build-options:
+      libdir: /app/lib
+      env:
+        LIBDIR: lib
+    sources:
+      - type: archive
+        url: https://dl.winehq.org/wine/source/11.x/wine-11.16.tar.xz
+        sha256: c66e2090343dcd727f7f7fd2f87ee0bfb0b118790c1d745ab7b8a4c3a4197f2f
+      # What each patch fixes, and why, is in docs/wine-fixes.md. 01-20 are the NZXT CAM
+      # series, unchanged; 21-25 are the ones Synapse needed on top. They are -p0
+      # patches, hence strip-components: 0.
+      - type: patch
+        path: ../patches/01-propsys-hid-properties.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/02-devicewatcher-updated-removed.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/03-hidclass-publish-hid-interface-properties.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/04-devquery-honour-filters.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/05-devquery-enumerate-interface-properties.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/06-ideviceinformation2.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/07-wineusb-register-usb-device-interface.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/08-winusb-implementation.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/09-setupapi-physical-device-object-name.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/10-winusb-overlapped-urb-completion.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/11-wintypes-ireference-uint16.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/12-propsys-system-devices-children.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/13-cfgmgr32-device-node-queries.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/14-deviceinformation-createfromidasync.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/15-deviceinformation-property-key-case.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/16-deviceinformation-findallasync-kind.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/17-devquery-string-filter-comparison.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/18-wineusb-ms-os-device-interface-guid.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/19-winrt-windows-devices-usb.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/20-explorer-systray-icon-window-title.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/21-server-hide-processes-still-starting.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/22-wintrust-appx-msix-signatures.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/23-usb-shared-container-id.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/24-winex11-keep-empty-window-empty.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/25-winebus-razer-keep-normal-mode.patch
+        strip-components: 0
+
+  # Needed by winetricks to unpack the corefonts and .NET cabs on first run.
+  - name: cabextract
+    sources:
+      - type: archive
+        url: https://deb.debian.org/debian/pool/main/c/cabextract/cabextract_1.11.orig.tar.gz
+        sha256: b5546db1155e4c718ff3d4b278573604f30dd64c3c5bfd4657cd089b823a3ac6
+        x-checker-data:
+          type: anitya
+          project-id: 245
+          stable-only: true
+          url-template: https://deb.debian.org/debian/pool/main/c/cabextract/cabextract_$version.orig.tar.gz
+
+  # Used for three verbs: corefonts, dotnet48 and win10. All are downloaded on first run
+  # rather than bundled: Microsoft's licences allow redistributing them in their original
+  # form only.
+  - name: winetricks
+    no-autogen: true
+    make-install-args:
+      - PREFIX=/app
+    sources:
+      - type: git
+        url: https://github.com/Winetricks/winetricks.git
+        tag: '20260125'
+        commit: b76e1ee79ac57d7aceb384f74518fc423265810c
+
+  - name: razer-synapse
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 -t /app/bin scripts/razer-synapse scripts/razer-synapse-setup
+        scripts/razer-synapse-autostart scripts/razer-synapse-xdpi
+      - install -Dm644 udev/60-razer-synapse.rules -t /app/share/razer-synapse
+      - install -Dm644 flatpak/io.github.adds39939.SynapseLinux.desktop
+        -t /app/share/applications
+      - install -Dm644 flatpak/io.github.adds39939.SynapseLinux.metainfo.xml
+        -t /app/share/metainfo
+      - install -Dm644 flatpak/io.github.adds39939.SynapseLinux.svg
+        -t /app/share/icons/hicolor/scalable/apps
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - .github
+          - .idea
+          - build
+          - build-dir
+          - repo
+          - .flatpak-builder

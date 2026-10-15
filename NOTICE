@@ -1,0 +1,42 @@
+Third-party components
+======================
+
+The Flatpak bundle published with each release contains a complete build of
+Wine -- its loader, its libraries, the patched kernel drivers (hidclass.sys,
+winebus.sys and wineusb.sys, with the libusb half wineusb.so) and the patched
+user-mode DLLs, all under /app.
+
+These are NOT original works of this repository. They are compiled from the
+Wine source tree with the patches in patches/ applied, and are therefore
+derivative works of Wine, licensed under the GNU Lesser General Public License
+version 2.1 or later (LGPL-2.1-or-later). Patches 01-20 come from the NZXT CAM
+on Linux project (https://github.com/adds39939/nzxt_cam_linux) unchanged.
+
+  Upstream source : https://dl.winehq.org/wine/source/
+  Version         : see WINE_VERSION
+  Modifications   : every patch in patches/
+  Rebuild         : flatpak-builder with
+                    flatpak/io.github.adds39939.SynapseLinux.yml
+
+The complete corresponding source is the upstream Wine tarball for the version
+named in WINE_VERSION -- which the manifest downloads by URL and verifies by
+sha256 -- plus the patches in patches/. The manifest is the build recipe, so it
+and this repository together reproduce the binaries exactly.
+
+The bundle also contains cabextract (GPL-2.0-or-later) and winetricks
+(LGPL-2.1-or-later), both built from source by the same manifest, from the URLs
+and revisions it pins.
+
+A copy of the LGPL-2.1 is available at:
+  https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
+
+This project ships no Razer code or assets. Razer Synapse is proprietary
+software; Razer's installer is downloaded from Razer by the application on first
+run, and Synapse is installed from it. "Razer" and "Synapse" are trademarks of
+their owner; this project is unaffiliated with and unendorsed by Razer. The
+application icon is original to this project.
+
+Microsoft's core fonts and .NET Framework 4.8 are likewise not shipped. They are
+downloaded on first run by winetricks, in their original redistributable form:
+Chromium cannot render without real fonts, and Razer's installer is a .NET
+Framework application.

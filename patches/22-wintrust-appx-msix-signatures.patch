@@ -1,0 +1,753 @@
+diff --git dlls/wintrust/Makefile.in dlls/wintrust/Makefile.in
+index 0c8d1b3..b670546 100644
+--- dlls/wintrust/Makefile.in
++++ dlls/wintrust/Makefile.in
+@@ -1,11 +1,13 @@
+ MODULE    = wintrust.dll
+ IMPORTLIB = wintrust
+-IMPORTS   = crypt32 user32 advapi32
++IMPORTS   = crypt32 user32 advapi32 $(ZLIB_PE_LIBS)
++EXTRAINCL = $(ZLIB_PE_CFLAGS)
+ DELAYIMPORTS = cryptui imagehlp
+ 
+ VER_PRODUCTVERSION = 6,1,7601,23769
+ 
+ SOURCES = \
++	appx.c \
+ 	asn.c \
+ 	crypt.c \
+ 	register.c \
+diff --git dlls/wintrust/appx.c dlls/wintrust/appx.c
+new file mode 100644
+index 0000000..585175a
+--- /dev/null
++++ dlls/wintrust/appx.c
+@@ -0,0 +1,606 @@
++/*
++ * Subject interface package for AppX/MSIX packages
++ *
++ * Copyright 2026 adds39939
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * An AppX or MSIX package is a ZIP archive whose last member, AppxSignature.p7x,
++ * holds the package signature: the four bytes "PKCX" followed by a DER PKCS#7
++ * SignedData. Its SpcIndirectDataContent carries an SpcSipInfo naming the AppX SIP,
++ * and a digest that is not a hash of the file but a concatenation of tagged hashes:
++ *
++ *   "APPX"
++ *   "AXPC" hash  every byte before AppxSignature.p7x's local header
++ *   "AXCD" hash  the central directory without AppxSignature.p7x's record, followed
++ *                by the end-of-directory records rewritten as if that member had
++ *                never been added
++ *   "AXCT" hash  [Content_Types].xml, uncompressed
++ *   "AXBM" hash  AppxBlockMap.xml, uncompressed
++ *   "AXCI" hash  AppxMetadata/CodeIntegrity.cat, uncompressed (only when present)
++ *
++ * all in the digest algorithm named by the indirect data.
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "wincrypt.h"
++#include "wintrust.h"
++#include "mssip.h"
++#include "zlib.h"
++#include "wintrust_priv.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(wintrust);
++
++const GUID appx_sip_guid =
++    { 0x0ac5df4b, 0xce07, 0x4de2, { 0xb7, 0x6e, 0x23, 0xc8, 0x39, 0xa0, 0x9f, 0xd1 } };
++
++#define ZIP_LOCAL_SIG         0x04034b50
++#define ZIP_CENTRAL_SIG       0x02014b50
++#define ZIP_EOCD_SIG          0x06054b50
++#define ZIP64_EOCD_SIG        0x06064b50
++#define ZIP64_LOCATOR_SIG     0x07064b50
++
++#define ZIP_LOCAL_SIZE        30
++#define ZIP_CENTRAL_SIZE      46
++#define ZIP_EOCD_SIZE         22
++#define ZIP64_EOCD_SIZE       56
++#define ZIP64_LOCATOR_SIZE    20
++
++/* Nothing in a package that is hashed whole is anywhere near this big. */
++#define APPX_MAX_DIRECTORY    (64 * 1024 * 1024)
++#define APPX_MAX_MEMBER       (64 * 1024 * 1024)
++
++static const char signature_name[] = "AppxSignature.p7x";
++
++struct appx_package
++{
++    HANDLE     file;
++    ULONGLONG  file_size;
++    BYTE      *directory;          /* the central directory */
++    DWORD      directory_size;
++    ULONGLONG  directory_offset;
++    ULONGLONG  entry_count;
++    BYTE       eocd[ZIP_EOCD_SIZE + 0xffff];
++    DWORD      eocd_size;          /* including the comment */
++    BOOL       zip64;
++    BYTE      *zip64_eocd;
++    DWORD      zip64_eocd_size;
++    BYTE       zip64_locator[ZIP64_LOCATOR_SIZE];
++};
++
++struct appx_member
++{
++    DWORD      record_offset;      /* offset of its record within the directory */
++    DWORD      record_size;
++    WORD       method;
++    ULONGLONG  compressed_size;
++    ULONGLONG  size;
++    ULONGLONG  local_offset;
++};
++
++static inline WORD get_u16( const BYTE *p ) { return p[0] | (p[1] << 8); }
++static inline DWORD get_u32( const BYTE *p ) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((DWORD)p[3] << 24); }
++static inline ULONGLONG get_u64( const BYTE *p ) { return get_u32( p ) | ((ULONGLONG)get_u32( p + 4 ) << 32); }
++
++static inline void put_u16( BYTE *p, WORD v ) { p[0] = v; p[1] = v >> 8; }
++static inline void put_u32( BYTE *p, DWORD v ) { put_u16( p, v ); put_u16( p + 2, v >> 16 ); }
++static inline void put_u64( BYTE *p, ULONGLONG v ) { put_u32( p, v ); put_u32( p + 4, v >> 32 ); }
++
++static BOOL read_at( HANDLE file, ULONGLONG offset, void *buffer, DWORD size )
++{
++    LARGE_INTEGER pos;
++    DWORD count;
++
++    pos.QuadPart = offset;
++    if (!SetFilePointerEx( file, pos, NULL, FILE_BEGIN )) return FALSE;
++    return ReadFile( file, buffer, size, &count, NULL ) && count == size;
++}
++
++static void appx_close( struct appx_package *pkg )
++{
++    free( pkg->directory );
++    free( pkg->zip64_eocd );
++}
++
++/* Find the end-of-directory records and read the central directory. */
++static BOOL appx_open( HANDLE file, struct appx_package *pkg )
++{
++    LARGE_INTEGER size;
++    BYTE *tail = NULL;
++    DWORD tail_size, i;
++    ULONGLONG tail_start;
++    BOOL found = FALSE;
++
++    memset( pkg, 0, sizeof(*pkg) );
++    pkg->file = file;
++
++    if (!GetFileSizeEx( file, &size ) || size.QuadPart < ZIP_EOCD_SIZE) return FALSE;
++    pkg->file_size = size.QuadPart;
++
++    /* The end-of-directory record is the last thing in the file, bar a comment. */
++    tail_size = min( pkg->file_size, ZIP_EOCD_SIZE + 0xffff );
++    tail_start = pkg->file_size - tail_size;
++    if (!(tail = malloc( tail_size ))) return FALSE;
++    if (!read_at( file, tail_start, tail, tail_size )) goto failed;
++
++    for (i = tail_size - ZIP_EOCD_SIZE + 1; i-- > 0;)
++    {
++        if (get_u32( tail + i ) != ZIP_EOCD_SIG) continue;
++        if (i + ZIP_EOCD_SIZE + get_u16( tail + i + 20 ) != tail_size) continue;
++        pkg->eocd_size = tail_size - i;
++        memcpy( pkg->eocd, tail + i, pkg->eocd_size );
++        found = TRUE;
++        break;
++    }
++    if (!found) goto failed;
++
++    pkg->entry_count      = get_u16( pkg->eocd + 10 );
++    pkg->directory_size   = get_u32( pkg->eocd + 12 );
++    pkg->directory_offset = get_u32( pkg->eocd + 16 );
++
++    /* The locator sits immediately before the end-of-directory record. */
++    if (tail_start + i >= ZIP64_LOCATOR_SIZE &&
++        read_at( file, tail_start + i - ZIP64_LOCATOR_SIZE, pkg->zip64_locator, ZIP64_LOCATOR_SIZE ) &&
++        get_u32( pkg->zip64_locator ) == ZIP64_LOCATOR_SIG)
++    {
++        ULONGLONG offset = get_u64( pkg->zip64_locator + 8 );
++        BYTE record[ZIP64_EOCD_SIZE];
++        ULONGLONG record_size;
++
++        if (!read_at( file, offset, record, sizeof(record) ) || get_u32( record ) != ZIP64_EOCD_SIG)
++            goto failed;
++        record_size = get_u64( record + 4 ) + 12;
++        if (record_size < ZIP64_EOCD_SIZE || record_size > 0x10000) goto failed;
++        if (!(pkg->zip64_eocd = malloc( record_size ))) goto failed;
++        pkg->zip64_eocd_size = record_size;
++        if (!read_at( file, offset, pkg->zip64_eocd, record_size )) goto failed;
++
++        pkg->zip64 = TRUE;
++        pkg->entry_count = get_u64( pkg->zip64_eocd + 32 );
++        if (get_u64( pkg->zip64_eocd + 40 ) > APPX_MAX_DIRECTORY) goto failed;
++        pkg->directory_size   = get_u64( pkg->zip64_eocd + 40 );
++        pkg->directory_offset = get_u64( pkg->zip64_eocd + 48 );
++    }
++
++    if (pkg->directory_size > APPX_MAX_DIRECTORY ||
++        pkg->directory_offset + pkg->directory_size > pkg->file_size)
++        goto failed;
++    if (!(pkg->directory = malloc( max( pkg->directory_size, 1 ) ))) goto failed;
++    if (!read_at( file, pkg->directory_offset, pkg->directory, pkg->directory_size )) goto failed;
++
++    free( tail );
++    return TRUE;
++
++failed:
++    free( tail );
++    appx_close( pkg );
++    return FALSE;
++}
++
++/* Decode the directory record at *offset, and advance past it. */
++static BOOL appx_next_member( const struct appx_package *pkg, DWORD *offset,
++                              struct appx_member *member, const char **name, WORD *name_len )
++{
++    const BYTE *rec = pkg->directory + *offset, *extra;
++    WORD extra_len, comment_len;
++    DWORD size;
++
++    if (*offset + ZIP_CENTRAL_SIZE > pkg->directory_size || get_u32( rec ) != ZIP_CENTRAL_SIG)
++        return FALSE;
++
++    *name_len   = get_u16( rec + 28 );
++    extra_len   = get_u16( rec + 30 );
++    comment_len = get_u16( rec + 32 );
++    size = ZIP_CENTRAL_SIZE + *name_len + extra_len + comment_len;
++    if (*offset + size > pkg->directory_size) return FALSE;
++
++    member->record_offset   = *offset;
++    member->record_size     = size;
++    member->method          = get_u16( rec + 10 );
++    member->compressed_size = get_u32( rec + 20 );
++    member->size            = get_u32( rec + 24 );
++    member->local_offset    = get_u32( rec + 42 );
++    *name = (const char *)rec + ZIP_CENTRAL_SIZE;
++
++    /* The ZIP64 extra field holds, in this order, whichever of the three did not fit. */
++    extra = rec + ZIP_CENTRAL_SIZE + *name_len;
++    while (extra_len >= 4)
++    {
++        WORD tag = get_u16( extra ), len = get_u16( extra + 2 );
++        const BYTE *p = extra + 4, *end = p + min( len, extra_len - 4 );
++
++        if (tag == 0x0001)
++        {
++            if (member->size == 0xffffffff && p + 8 <= end) { member->size = get_u64( p ); p += 8; }
++            if (member->compressed_size == 0xffffffff && p + 8 <= end) { member->compressed_size = get_u64( p ); p += 8; }
++            if (member->local_offset == 0xffffffff && p + 8 <= end) member->local_offset = get_u64( p );
++        }
++        if (len + 4 > extra_len) break;
++        extra += len + 4;
++        extra_len -= len + 4;
++    }
++
++    *offset += size;
++    return TRUE;
++}
++
++static BOOL appx_find_member( const struct appx_package *pkg, const char *wanted, struct appx_member *member )
++{
++    DWORD offset = 0, len = strlen( wanted );
++    const char *name;
++    WORD name_len;
++
++    while (appx_next_member( pkg, &offset, member, &name, &name_len ))
++        if (name_len == len && !memcmp( name, wanted, len )) return TRUE;
++    return FALSE;
++}
++
++/* Wine's zlib has no allocator of its own. */
++static void *zalloc( void *opaque, unsigned int items, unsigned int size )
++{
++    return calloc( items, size );
++}
++
++static void zfree( void *opaque, void *ptr )
++{
++    free( ptr );
++}
++
++/* Read a member's contents, uncompressed. */
++static BOOL appx_read_member( const struct appx_package *pkg, const struct appx_member *member,
++                              BYTE **data, DWORD *size )
++{
++    BYTE local[ZIP_LOCAL_SIZE], *packed = NULL, *out = NULL;
++    ULONGLONG start;
++
++    *data = NULL;
++    *size = 0;
++    if (member->size > APPX_MAX_MEMBER || member->compressed_size > APPX_MAX_MEMBER) return FALSE;
++    if (!read_at( pkg->file, member->local_offset, local, sizeof(local) ) ||
++        get_u32( local ) != ZIP_LOCAL_SIG)
++        return FALSE;
++    start = member->local_offset + ZIP_LOCAL_SIZE + get_u16( local + 26 ) + get_u16( local + 28 );
++    if (start + member->compressed_size > pkg->file_size) return FALSE;
++
++    if (!(out = malloc( max( member->size, 1 ) ))) return FALSE;
++
++    if (member->method == 0)
++    {
++        if (member->compressed_size != member->size ||
++            !read_at( pkg->file, start, out, member->size ))
++            goto failed;
++    }
++    else if (member->method == 8)
++    {
++        z_stream z;
++        int ret;
++
++        if (!(packed = malloc( max( member->compressed_size, 1 ) ))) goto failed;
++        if (!read_at( pkg->file, start, packed, member->compressed_size )) goto failed;
++
++        memset( &z, 0, sizeof(z) );
++        z.zalloc = zalloc;
++        z.zfree  = zfree;
++        if ((ret = inflateInit2( &z, -MAX_WBITS )) != Z_OK)
++        {
++            WARN( "inflateInit2 failed with %d\n", ret );
++            goto failed;
++        }
++        z.next_in   = packed;
++        z.avail_in  = member->compressed_size;
++        z.next_out  = out;
++        z.avail_out = member->size;
++        ret = inflate( &z, Z_FINISH );
++        inflateEnd( &z );
++        if (ret != Z_STREAM_END || z.total_out != member->size)
++        {
++            WARN( "inflate returned %d, %lu of %I64u bytes\n", ret, z.total_out, member->size );
++            goto failed;
++        }
++        free( packed );
++    }
++    else
++    {
++        FIXME( "unsupported compression method %u\n", member->method );
++        goto failed;
++    }
++
++    *data = out;
++    *size = member->size;
++    return TRUE;
++
++failed:
++    free( packed );
++    free( out );
++    return FALSE;
++}
++
++static BOOL is_appx_package( HANDLE file )
++{
++    struct appx_package pkg;
++    struct appx_member member;
++    BYTE magic[4];
++    BOOL ret;
++
++    if (!read_at( file, 0, magic, sizeof(magic) ) || get_u32( magic ) != ZIP_LOCAL_SIG) return FALSE;
++    if (!appx_open( file, &pkg )) return FALSE;
++    ret = appx_find_member( &pkg, signature_name, &member );
++    appx_close( &pkg );
++    return ret;
++}
++
++/***********************************************************************
++ *      AppxSipIsFileSupported
++ *
++ * Registered as the AppX SIP's CryptSIPDllIsMyFileType function.
++ */
++BOOL WINAPI AppxSipIsFileSupported( HANDLE file, GUID *subject )
++{
++    LARGE_INTEGER zero, pos;
++    BOOL ret;
++
++    TRACE( "(%p %p)\n", file, subject );
++
++    zero.QuadPart = 0;
++    if (!SetFilePointerEx( file, zero, &pos, FILE_CURRENT )) return FALSE;
++    ret = is_appx_package( file );
++    SetFilePointerEx( file, pos, NULL, FILE_BEGIN );
++    if (ret) *subject = appx_sip_guid;
++    return ret;
++}
++
++/* CryptSIPGetSignedDataMsg for packages: the PKCS#7 inside AppxSignature.p7x. */
++BOOL appx_get_signed_msg( SIP_SUBJECTINFO *info, DWORD *encoding, DWORD index,
++                          DWORD *msg_size, BYTE *msg )
++{
++    struct appx_package pkg;
++    struct appx_member member;
++    HANDLE file = info->hFile;
++    BYTE *data = NULL;
++    DWORD size;
++    BOOL ret = FALSE;
++
++    TRACE( "(%p %p %lu %p %p)\n", info, encoding, index, msg_size, msg );
++
++    if (index)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!file || file == INVALID_HANDLE_VALUE)
++    {
++        file = CreateFileW( info->pwsFileName, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++        if (file == INVALID_HANDLE_VALUE) return FALSE;
++    }
++
++    if (!appx_open( file, &pkg ))
++    {
++        WARN( "not a package\n" );
++        SetLastError( TRUST_E_SUBJECT_FORM_UNKNOWN );
++        goto done;
++    }
++    if (!appx_find_member( &pkg, signature_name, &member ) ||
++        !appx_read_member( &pkg, &member, &data, &size ) ||
++        size <= 4 || memcmp( data, "PKCX", 4 ))
++    {
++        WARN( "no usable %s\n", signature_name );
++        SetLastError( TRUST_E_NOSIGNATURE );
++        goto close;
++    }
++
++    if (!msg)
++        ret = TRUE;
++    else if (*msg_size < size - 4)
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++    else
++    {
++        memcpy( msg, data + 4, size - 4 );
++        ret = TRUE;
++    }
++    *msg_size = size - 4;
++    if (ret) *encoding = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
++
++close:
++    free( data );
++    appx_close( &pkg );
++done:
++    if (file != info->hFile) CloseHandle( file );
++    return ret;
++}
++
++static BOOL hash_range( HANDLE file, ULONGLONG start, ULONGLONG end, HCRYPTHASH hash )
++{
++    DWORD chunk = min( end - start, 1024 * 1024 );
++    BYTE *buffer;
++    BOOL ret = TRUE;
++
++    if (start == end) return TRUE;
++    if (!(buffer = malloc( chunk ))) return FALSE;
++    while (ret && start < end)
++    {
++        DWORD len = min( end - start, chunk );
++        ret = read_at( file, start, buffer, len ) && CryptHashData( hash, buffer, len, 0 );
++        start += len;
++    }
++    free( buffer );
++    return ret;
++}
++
++/* AXCD: the directory and its end records, as they were before the signature was added. */
++static BOOL hash_directory( const struct appx_package *pkg, const struct appx_member *sig, HCRYPTHASH hash )
++{
++    ULONGLONG entries = pkg->entry_count - 1;
++    ULONGLONG size = pkg->directory_size - sig->record_size;
++    ULONGLONG offset = sig->local_offset;   /* the directory moves up into its place */
++    BYTE *eocd;
++    BOOL ret;
++
++    if (!CryptHashData( hash, pkg->directory, sig->record_offset, 0 )) return FALSE;
++    if (!CryptHashData( hash, pkg->directory + sig->record_offset + sig->record_size,
++                        pkg->directory_size - sig->record_offset - sig->record_size, 0 ))
++        return FALSE;
++
++    if (pkg->zip64)
++    {
++        BYTE *record, locator[ZIP64_LOCATOR_SIZE];
++
++        if (!(record = malloc( pkg->zip64_eocd_size ))) return FALSE;
++        memcpy( record, pkg->zip64_eocd, pkg->zip64_eocd_size );
++        put_u64( record + 24, entries );
++        put_u64( record + 32, entries );
++        put_u64( record + 40, size );
++        put_u64( record + 48, offset );
++        memcpy( locator, pkg->zip64_locator, sizeof(locator) );
++        put_u64( locator + 8, offset + size );
++        ret = CryptHashData( hash, record, pkg->zip64_eocd_size, 0 ) &&
++              CryptHashData( hash, locator, sizeof(locator), 0 );
++        free( record );
++        if (!ret) return FALSE;
++    }
++
++    /* Fields that defer to the ZIP64 record keep their 0xffff... markers. */
++    if (!(eocd = malloc( pkg->eocd_size ))) return FALSE;
++    memcpy( eocd, pkg->eocd, pkg->eocd_size );
++    if (get_u16( eocd + 8 ) != 0xffff) put_u16( eocd + 8, entries );
++    if (get_u16( eocd + 10 ) != 0xffff) put_u16( eocd + 10, entries );
++    if (get_u32( eocd + 12 ) != 0xffffffff) put_u32( eocd + 12, size );
++    if (get_u32( eocd + 16 ) != 0xffffffff) put_u32( eocd + 16, offset );
++    ret = CryptHashData( hash, eocd, pkg->eocd_size, 0 );
++    free( eocd );
++    return ret;
++}
++
++static BOOL hash_member( const struct appx_package *pkg, const char *name, HCRYPTHASH hash )
++{
++    struct appx_member member;
++    BYTE *data;
++    DWORD size;
++    BOOL ret;
++
++    if (!appx_find_member( pkg, name, &member ))
++    {
++        WARN( "package has no %s\n", debugstr_a(name) );
++        return FALSE;
++    }
++    if (!appx_read_member( pkg, &member, &data, &size )) return FALSE;
++    ret = CryptHashData( hash, data, size, 0 );
++    free( data );
++    return ret;
++}
++
++static BOOL check_part( HCRYPTPROV prov, ALG_ID alg, const struct appx_package *pkg,
++                        const struct appx_member *sig, const char *tag, const BYTE *expected,
++                        DWORD expected_size )
++{
++    HCRYPTHASH hash;
++    BYTE value[64];
++    DWORD value_size = sizeof(value);
++    BOOL ret;
++
++    if (!CryptCreateHash( prov, alg, 0, 0, &hash )) return FALSE;
++
++    if (!memcmp( tag, "AXPC", 4 ))
++        ret = hash_range( pkg->file, 0, sig->local_offset, hash );
++    else if (!memcmp( tag, "AXCD", 4 ))
++        ret = hash_directory( pkg, sig, hash );
++    else if (!memcmp( tag, "AXCT", 4 ))
++        ret = hash_member( pkg, "[Content_Types].xml", hash );
++    else if (!memcmp( tag, "AXBM", 4 ))
++        ret = hash_member( pkg, "AppxBlockMap.xml", hash );
++    else if (!memcmp( tag, "AXCI", 4 ))
++        ret = hash_member( pkg, "AppxMetadata/CodeIntegrity.cat", hash );
++    else
++    {
++        FIXME( "unknown package digest part %s\n", debugstr_an(tag, 4) );
++        ret = FALSE;
++    }
++
++    if (ret) ret = CryptGetHashParam( hash, HP_HASHVAL, value, &value_size, 0 );
++    CryptDestroyHash( hash );
++    if (!ret) return FALSE;
++
++    if (value_size != expected_size || memcmp( value, expected, value_size ))
++    {
++        WARN( "%s does not match\n", debugstr_an(tag, 4) );
++        return FALSE;
++    }
++    return TRUE;
++}
++
++/* Check a package against the digest in its signature's indirect data. */
++DWORD appx_verify_digest( HANDLE file, HCRYPTPROV prov, const SPC_INDIRECT_DATA_CONTENT *indirect )
++{
++    const BYTE *digest = indirect->Digest.pbData;
++    DWORD digest_size = indirect->Digest.cbData, hash_size, len, pos;
++    struct appx_package pkg;
++    struct appx_member sig;
++    BOOL release_prov = FALSE, have_pc = FALSE, have_cd = FALSE;
++    HCRYPTHASH hash;
++    DWORD err = TRUST_E_BAD_DIGEST;
++    ALG_ID alg;
++
++    if (((ULONG_PTR)indirect->Data.pszObjId >> 16) == 0 ||
++        strcmp( indirect->Data.pszObjId, SPC_SIGINFO_OBJID ))
++        return TRUST_E_SUBJECT_FORM_UNKNOWN;
++    if (!(alg = CertOIDToAlgId( indirect->DigestAlgorithm.pszObjId ))) return TRUST_E_SYSTEM_ERROR;
++    if (digest_size < 4 || memcmp( digest, "APPX", 4 )) return TRUST_E_BAD_DIGEST;
++
++    if (!prov)
++    {
++        if (!CryptAcquireContextW( &prov, NULL, MS_ENH_RSA_AES_PROV_W, PROV_RSA_AES, CRYPT_VERIFYCONTEXT ))
++            return GetLastError();
++        release_prov = TRUE;
++    }
++
++    len = sizeof(hash_size);
++    if (!CryptCreateHash( prov, alg, 0, 0, &hash ))
++    {
++        err = GetLastError();
++        goto done;
++    }
++    if (!CryptGetHashParam( hash, HP_HASHSIZE, (BYTE *)&hash_size, &len, 0 )) hash_size = 0;
++    CryptDestroyHash( hash );
++    if (!hash_size || hash_size > 64) goto done;
++
++    if (!appx_open( file, &pkg )) goto done;
++    if (!appx_find_member( &pkg, signature_name, &sig )) goto close;
++
++    for (pos = 4; pos < digest_size; pos += 4 + hash_size)
++    {
++        if (pos + 4 + hash_size > digest_size) goto close;
++        if (!check_part( prov, alg, &pkg, &sig, (const char *)digest + pos, digest + pos + 4, hash_size ))
++            goto close;
++        if (!memcmp( digest + pos, "AXPC", 4 )) have_pc = TRUE;
++        if (!memcmp( digest + pos, "AXCD", 4 )) have_cd = TRUE;
++    }
++    /* Between them these two cover every byte of the package but the signature. */
++    if (have_pc && have_cd) err = S_OK;
++
++close:
++    appx_close( &pkg );
++done:
++    if (release_prov) CryptReleaseContext( prov, 0 );
++    TRACE( "returning %#lx\n", err );
++    return err;
++}
+diff --git dlls/wintrust/crypt.c dlls/wintrust/crypt.c
+index ad6f264..8f6555a 100644
+--- dlls/wintrust/crypt.c
++++ dlls/wintrust/crypt.c
+@@ -32,6 +32,7 @@
+ #include "mssip.h"
+ #include "imagehlp.h"
+ #include "winternl.h"
++#include "wintrust_priv.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -1645,6 +1646,9 @@ BOOL WINAPI CryptSIPGetSignedDataMsg(SIP_SUBJECTINFO* pSubjectInfo, DWORD* pdwEn
+     else if (!memcmp(pSubjectInfo->pgSubjectType, &catGUID, sizeof(catGUID)))
+         ret = WINTRUST_GetSignedMsgFromCatFile(pSubjectInfo, pdwEncodingType,
+          dwIndex, pcbSignedDataMsg, pbSignedDataMsg);
++    else if (IsEqualGUID(pSubjectInfo->pgSubjectType, &appx_sip_guid))
++        ret = appx_get_signed_msg(pSubjectInfo, pdwEncodingType,
++         dwIndex, pcbSignedDataMsg, pbSignedDataMsg);
+     else
+     {
+         FIXME("unimplemented for subject type %s\n",
+diff --git dlls/wintrust/register.c dlls/wintrust/register.c
+index 49b8ce0..2c3c12a 100644
+--- dlls/wintrust/register.c
++++ dlls/wintrust/register.c
+@@ -978,6 +978,36 @@ static BOOL WINTRUST_SIPPAddProvider(GUID* Subject, WCHAR* MagicNumber)
+     return Ret;
+ }
+ 
++/***********************************************************************
++ *              WINTRUST_SIPPAddAppxProvider
++ *
++ * AppX and MSIX packages. Windows registers these from AppxSip.dll; here the
++ * same functions are wintrust's own, and the package is recognised by contents
++ * rather than by magic number, since every ZIP file starts the same way.
++ */
++static BOOL WINTRUST_SIPPAddAppxProvider(void)
++{
++    SIP_ADD_NEWPROVIDER NewProv;
++    BOOL Ret;
++
++    memset(&NewProv, 0, sizeof(SIP_ADD_NEWPROVIDER));
++    NewProv.cbStruct = sizeof(SIP_ADD_NEWPROVIDER);
++    NewProv.pwszDLLFileName = wcsdup(SP_POLICY_PROVIDER_DLL_NAME);
++    NewProv.pgSubject              = (GUID *)&appx_sip_guid;
++    NewProv.pwszIsFunctionName     = (WCHAR *)L"AppxSipIsFileSupported";
++    NewProv.pwszGetFuncName        = (WCHAR *)L"CryptSIPGetSignedDataMsg";
++    NewProv.pwszPutFuncName        = (WCHAR *)L"CryptSIPPutSignedDataMsg";
++    NewProv.pwszCreateFuncName     = (WCHAR *)L"CryptSIPCreateIndirectData";
++    NewProv.pwszVerifyFuncName     = (WCHAR *)L"CryptSIPVerifyIndirectData";
++    NewProv.pwszRemoveFuncName     = (WCHAR *)L"CryptSIPRemoveSignedDataMsg";
++
++    Ret = CryptSIPAddProvider(&NewProv);
++
++    free(NewProv.pwszDLLFileName);
++
++    return Ret;
++}
++
+ /***********************************************************************
+  *              DllRegisterServer (WINTRUST.@)
+  */
+@@ -1126,6 +1156,8 @@ add_trust_providers:
+         SIPAddProviderRes = S_FALSE;
+     if (!WINTRUST_SIPPAddProvider(&Unknown6, CafeBabe))
+         SIPAddProviderRes = S_FALSE;
++    if (!WINTRUST_SIPPAddAppxProvider())
++        SIPAddProviderRes = S_FALSE;
+ 
+     /* Native does a CryptSIPRemoveProvider here for {941C2937-1292-11D1-85BE-00C04FC295EE}.
+      * This SIP Provider is however not found on up-to-date window install and native will
+diff --git dlls/wintrust/softpub.c dlls/wintrust/softpub.c
+index 609d240..2bde365 100644
+--- dlls/wintrust/softpub.c
++++ dlls/wintrust/softpub.c
+@@ -26,6 +26,7 @@
+ #include "mssip.h"
+ #include "softpub.h"
+ #include "winnls.h"
++#include "wintrust_priv.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wintrust);
+@@ -315,6 +316,9 @@ static DWORD SOFTPUB_VerifyImageHash(CRYPT_PROVIDER_DATA *data, HANDLE file)
+     HCRYPTHASH hash = 0;
+     ALG_ID algID;
+ 
++    if (IsEqualGUID(&data->pPDSip->gSubject, &appx_sip_guid))
++        return appx_verify_digest(file, data->hProv, indirect);
++
+     if (((ULONG_PTR)indirect->Data.pszObjId >> 16) == 0 ||
+         strcmp(indirect->Data.pszObjId, SPC_PE_IMAGE_DATA_OBJID))
+     {
+diff --git dlls/wintrust/wintrust.spec dlls/wintrust/wintrust.spec
+index 79e9bd3..face0f6 100644
+--- dlls/wintrust/wintrust.spec
++++ dlls/wintrust/wintrust.spec
+@@ -40,6 +40,7 @@
+ @ stdcall CryptCATPutMemberInfo(ptr wstr wstr ptr long long ptr)
+ @ stub CryptCATStoreFromHandle
+ @ stub CryptCATVerifyMember
++@ stdcall -private AppxSipIsFileSupported(long ptr)
+ @ stdcall CryptSIPCreateIndirectData(ptr ptr ptr)
+ #@ stub CryptSIPGetCaps
+ @ stub CryptSIPGetInfo
+diff --git dlls/wintrust/wintrust_priv.h dlls/wintrust/wintrust_priv.h
+index 1e2e7a7..d4c86f7 100644
+--- dlls/wintrust/wintrust_priv.h
++++ dlls/wintrust/wintrust_priv.h
+@@ -25,4 +25,11 @@ BOOL WINAPI WINTRUST_AddCert(CRYPT_PROVIDER_DATA *data, DWORD idxSigner,
+  BOOL fCounterSigner, DWORD idxCounterSigner, PCCERT_CONTEXT pCert2Add);
+ BOOL WINAPI WINTRUST_AddPrivData(CRYPT_PROVIDER_DATA *data, CRYPT_PROVIDER_PRIVDATA *pPrivData2Add);
+ 
++/* appx.c */
++extern const GUID appx_sip_guid;
++BOOL WINAPI AppxSipIsFileSupported(HANDLE file, GUID *subject);
++BOOL appx_get_signed_msg(SIP_SUBJECTINFO *info, DWORD *encoding, DWORD index,
++ DWORD *msg_size, BYTE *msg);
++DWORD appx_verify_digest(HANDLE file, HCRYPTPROV prov, const SPC_INDIRECT_DATA_CONTENT *indirect);
++
+ #endif /* ndef __WINTRUST_PRIV_H__ */

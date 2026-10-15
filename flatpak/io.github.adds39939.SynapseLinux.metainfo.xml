@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.adds39939.SynapseLinux</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT AND LGPL-2.1-or-later</project_license>
+
+  <name>Razer Synapse</name>
+  <summary>Run Razer Synapse on Linux and configure your Razer devices</summary>
+
+  <developer id="io.github.adds39939">
+    <name>adds39939</name>
+  </developer>
+
+  <description>
+    <p>
+      Razer Synapse is Razer's own software for their mice, keyboards and other
+      peripherals. It is Windows-only. This package runs the current Synapse 4 on Linux
+      under a patched build of Wine, talking to your devices directly over HID, the way
+      it does on Windows.
+    </p>
+    <p>What works, verified with a Naga V2 Pro on its HyperSpeed receiver:</p>
+    <ul>
+      <li>The mouse and its receiver are detected, with live battery level</li>
+      <li>The device's settings are read from it -- sensitivity stages, polling rate,
+          which side plate is fitted</li>
+      <li>Changes are written back to the mouse, confirmed by reading them back
+          independently</li>
+      <li>Button assignments apply everywhere on the desktop, through the mouse's own
+          firmware</li>
+      <li>Lighting effects and brightness</li>
+      <li>The interface scales to match your desktop</li>
+    </ul>
+    <p>
+      Razer Synapse itself is not included. Razer's own installer is downloaded from
+      Razer the first time the application starts, and you install Synapse from it as
+      you would on Windows. This project is not affiliated with or endorsed by Razer.
+    </p>
+    <p>
+      One step needs root on the host and cannot be done from inside the sandbox:
+      installing a udev rule so that Razer devices are readable by your user. Run
+      "flatpak run --command=razer-synapse-setup io.github.adds39939.SynapseLinux
+      --udev-help" for the exact commands. If you already use OpenRGB, its rule covers
+      it.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.adds39939.SynapseLinux.desktop</launchable>
+
+  <url type="homepage">https://github.com/adds39939/synapse-linux</url>
+  <url type="bugtracker">https://github.com/adds39939/synapse-linux/issues</url>
+  <url type="help">https://github.com/adds39939/synapse-linux/blob/main/docs/troubleshooting.md</url>
+  <url type="vcs-browser">https://github.com/adds39939/synapse-linux</url>
+
+  <categories>
+    <category>Settings</category>
+    <category>HardwareSettings</category>
+  </categories>
+
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <recommends>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </recommends>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-10-15">
+      <description>
+        <p>First release. Wine, patched, is bundled -- nothing is needed on the host
+        except a udev rule.</p>
+      </description>
+    </release>
+  </releases>
+</component>

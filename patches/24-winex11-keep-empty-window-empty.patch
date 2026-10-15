@@ -1,0 +1,15 @@
+diff --git dlls/winex11.drv/window.c dlls/winex11.drv/window.c
+index d7df0a8..edbaaf5 100644
+--- dlls/winex11.drv/window.c
++++ dlls/winex11.drv/window.c
+@@ -1772,6 +1772,10 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
+     else OffsetRect( &rect, old_rect.left - new_rect.left, old_rect.top - new_rect.top );
+     if (rect.right == old_rect.right && rect.bottom == old_rect.bottom) flags |= SWP_NOSIZE;
+     else if (IsRectEmpty( &rect )) flags |= SWP_NOSIZE;
++    /* an empty win32 window is held by a 1x1 X window with an empty shape, so the size
++     * X reports for it -- that 1x1, or whatever it had before it was emptied -- is not
++     * the window's size and must not replace it */
++    else if (IsRectEmpty( &old_rect )) flags |= SWP_NOSIZE;
+ 
+     /* don't sync win32 position for offscreen windows */
+     if ((data->is_offscreen = !is_window_rect_mapped( &new_rect ))) flags |= SWP_NOMOVE;

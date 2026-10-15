@@ -1,0 +1,7 @@
+*.log
+/build/
+/build-dir/
+/repo/
+/wine-*/
+/.flatpak-builder/
+*.flatpak

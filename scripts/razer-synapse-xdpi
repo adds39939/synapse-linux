@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Work out the display DPI, and optionally give it to Wine.
+
+    razer-synapse-xdpi            print the DPI the desktop sets for X clients, or
+                                  nothing if it sets none
+    razer-synapse-xdpi --apply    write the DPI Synapse should render at into the
+                                  prefix, if it is not there already
+
+Synapse always renders at 100%, so on a scaled display it comes out small, and the only
+lever Wine gives us is HKCU\\Control Panel\\Desktop\\LogPixels -- Wine reads no X resource
+of its own. Chromium reports that DPI as its device pixel ratio and renders at it, so
+the result is sharp rather than a 100% window stretched by the compositor.
+
+Getting the number inside the sandbox is the awkward part. kscreen-doctor, xrdb and
+xprop are all outside it, and the desktop settings portal is no help on the desktop that
+needs it most: KDE answers org.gnome.desktop.interface/scaling-factor with the integer 1
+whether the display is at 100% or 145%, because that key cannot express a fractional
+scale.
+
+What KDE does set, for the benefit of every XWayland client, is the Xft.dpi X resource
+-- 139 for a 1.45 scale. That is a real fractional signal, it is what other X
+applications scale by, and it is readable through the X socket the app already has.
+GNOME sets it too. So read it from the X server's resource manager string, which is
+three calls into libX11 and needs nothing installed.
+
+In order, --apply takes: RAZER_SYNAPSE_SCALE if set, Xft.dpi, then the portal.
+"""
+
+import ctypes
+import os
+import re
+import subprocess
+import sys
+
+DESKTOP_KEY = r"HKCU\Control Panel\Desktop"
+
+
+def xft_dpi():
+    xlib = ctypes.CDLL("libX11.so.6")
+    xlib.XOpenDisplay.restype = ctypes.c_void_p
+    xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    xlib.XResourceManagerString.restype = ctypes.c_char_p
+    xlib.XResourceManagerString.argtypes = [ctypes.c_void_p]
+    xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+    display = xlib.XOpenDisplay(None)
+    if not display:
+        return None
+    try:
+        resources = xlib.XResourceManagerString(display) or b""
+    finally:
+        xlib.XCloseDisplay(display)
+
+    for line in resources.decode("utf-8", "replace").splitlines():
+        name, _, value = line.partition(":")
+        if name.strip().lower() != "xft.dpi":
+            continue
+        try:
+            # Written as an integer in practice, but accept "139.0" as well.
+            return int(round(float(value.strip())))
+        except ValueError:
+            return None
+    return None
+
+
+def portal_read(namespace, key):
+    """One value from the settings portal, or None. gdbus prints it as a variant --
+    "(<uint32 1>,)" or "(<1.0>,)" -- so take the last token inside the brackets."""
+    try:
+        out = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.freedesktop.portal.Desktop",
+             "--object-path", "/org/freedesktop/portal/desktop",
+             "--method", "org.freedesktop.portal.Settings.ReadOne", namespace, key],
+            capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.match(r"^\(<(?:[a-z0-9]+ )?(.*)>,\)$", out.strip())
+    try:
+        return float(m.group(1)) if m else None
+    except ValueError:
+        return None
+
+
+def portal_dpi():
+    """What GTK itself does: an integer window scale times a fractional text scale."""
+    factor = portal_read("org.gnome.desktop.interface", "scaling-factor") or 1
+    text = portal_read("org.gnome.desktop.interface", "text-scaling-factor") or 1
+    factor = max(factor, 1)
+    if text < 0.5:
+        text = 1
+    return int(96 * factor * text + 0.5)
+
+
+def target_dpi():
+    scale = os.environ.get("RAZER_SYNAPSE_SCALE")
+    if scale:
+        try:
+            return int(float(scale) * 96 + 0.5)
+        except ValueError:
+            print(f"razer-synapse: ignoring RAZER_SYNAPSE_SCALE={scale!r}", file=sys.stderr)
+    try:
+        dpi = xft_dpi()
+    except Exception:
+        dpi = None
+    if dpi and 96 < dpi <= 480:
+        return dpi
+    return portal_dpi()
+
+
+def current_dpi():
+    out = subprocess.run(["wine", "reg", "query", DESKTOP_KEY, "/v", "LogPixels"],
+                         capture_output=True, text=True).stdout
+    m = re.search(r"LogPixels\s+REG_DWORD\s+0x([0-9a-fA-F]+)", out)
+    return int(m.group(1), 16) if m else None
+
+
+def apply():
+    dpi = target_dpi()
+    if not 96 <= dpi <= 480:
+        return 0
+    cur = current_dpi()
+    # An unset LogPixels already means 96, so do not write it just to say so -- that
+    # would bounce the wineserver on a first launch for no change at all.
+    if cur == dpi or (cur is None and dpi == 96):
+        return 0
+    print(f"razer-synapse: setting Wine's DPI to {dpi}")
+    subprocess.run(["wine", "reg", "add", DESKTOP_KEY, "/v", "LogPixels", "/t", "REG_DWORD",
+                    "/d", str(dpi), "/f"], capture_output=True)
+    subprocess.run(["wineserver", "-w"])
+    return 0
+
+
+def main():
+    if sys.argv[1:] == ["--apply"]:
+        return apply()
+    if sys.argv[1:]:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    try:
+        dpi = xft_dpi()
+    except Exception:
+        return 1
+    # Below 96 is not a scale anyone asked for, and 96 is the default anyway.
+    if dpi is None or dpi <= 96 or dpi > 480:
+        return 1
+    print(dpi)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
