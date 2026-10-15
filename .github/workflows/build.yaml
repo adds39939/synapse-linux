@@ -121,7 +121,7 @@ jobs:
       # which only saves in a post step that is skipped when the job fails.
       - name: Restore the build cache
         id: cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             .flatpak-builder/ccache
@@ -136,7 +136,7 @@ jobs:
 
       - name: Save the build cache
         if: always() && steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             .flatpak-builder/ccache
