@@ -345,6 +345,89 @@ listed after it.
 interfaces is linked -- what Windows does. The same prefix then gives 19 interfaces and
 19 devices, each the interface's own.
 
+### 27. Every process carried its own copy of App Engine's executable
+
+**Symptom:** Synapse took 6 GB sitting in the tray. Each of App Engine's Electron
+processes held 210-250 MB of private memory before it had done any work, and Synapse
+runs nine or more of them: a renderer for every hidden window (tray menu, background
+manager, lighting engine, notifications, Game Manager proxy, each device page) as
+well as the main, GPU and network processes.
+
+**Cause:** `RazerAppEngine.exe` is linked with 512-byte file alignment, as nearly every
+Windows binary is, so its sections start at file offsets that are not page-aligned:
+`.text` is at 0x400 in the file and 0x1000 in memory. `mmap()` cannot map that, so Wine
+falls back to `pread()`-ing each section into anonymous memory -- a private copy in
+every process that loads the image, where Windows shares one between them all. In
+`/proc/<pid>/smaps` it is the anonymous, executable mapping at the image base:
+
+```
+140001000-14ad87000 r-xp 00000000 00:00 0          Rss: 177688 kB  Anonymous: 177688 kB
+```
+
+Every DLL App Engine ships (`libGLESv2.dll`, `ffmpeg.dll`, ...) was loaded the same way.
+
+**Fix:** patch 27 has the wineserver write those sections once into a temp file laid
+out the way the image is in memory, and hand it to every process mapping the image,
+which maps the sections from it copy-on-write. Their pages are then shared like any
+other file mapping. The copy is kept per file, next to the one Wine already keeps for
+shared PE sections, and lives as long as anything has the image mapped. Wine refuses
+to open a mapped image for writing, so it cannot go stale.
+
+### 28. Transparent huge pages, 2 MB at a time
+
+**Symptom:** 4.6 GB of Synapse's 5.6 GB of anonymous memory was in transparent huge
+pages (`AnonHugePages` in `/proc/<pid>/smaps_rollup`) -- 876 MB of the Game Manager
+proxy's 932 MB. Most of that was the copies and the table that 27 and 29 get rid of,
+but not all of it.
+
+**Cause:** Arch's kernel sets `/sys/kernel/mm/transparent_hugepage/enabled` to
+`always`. Windows programs commit memory a page at a time -- Chromium's allocators
+reserve large regions and commit into them sparsely -- but with THP on `always` the
+first touch anywhere in a 2 MB-aligned stretch of a committed region brings in a whole
+2 MB page, and khugepaged goes on to collapse more of them for as long as Synapse runs.
+
+**Fix:** patch 28 has every Wine process opt out with `prctl(PR_SET_THP_DISABLE)`,
+which child processes and the wineserver inherit. Measured on NZXT CAM, which runs
+five Electron processes under the same Wine, it is worth about 70 MB on top of the
+other two patches; Synapse runs more processes than that.
+
+### 29. A terabyte of reserved address space cost hundreds of MB per process
+
+**Symptom:** with those two fixed, NZXT CAM's renderer and main process -- the same
+Electron under the same Wine -- still had about 280 MB each resident that was entirely
+zero.
+
+**Cause:** Wine keeps every page's protection in a table, one byte per 4 KB page of
+address space. V8 reserves its sandbox up front -- about 1.4 TB in each of App
+Engine's renderers -- and reserving writes the protection bytes for the whole range.
+They are zero, but writing them faults in up to 350 MB of table per process.
+
+**Fix:** patch 29 drops whole pages of the table that are being set to zero
+(`madvise(MADV_DONTNEED)`) instead of writing them. They read back as zero without
+being resident until something is committed in that range.
+
+### What it adds up to
+
+PSS of every process in the sandbox, from `/proc/<pid>/smaps_rollup`, with Synapse's
+window closed to the tray. The total also counts the part of the wineserver's
+shared copies (330 MB in all) that no process has mapped.
+
+| Process | Before | After |
+| --- | ---: | ---: |
+| Main | 822 MB | 252 MB |
+| GPU | 714 MB | 261 MB |
+| Network service | 244 MB | 25 MB |
+| Renderer: Game Manager proxy | 935 MB | 40 MB |
+| Renderer: tray menu | 666 MB | 57 MB |
+| Renderer: device page | 628 MB | 64 MB |
+| Renderer: background manager | 625 MB | 60 MB |
+| Renderer: lighting engine | 621 MB | 60 MB |
+| Renderer: notifications | 606 MB | 48 MB |
+| **Total** | **5,991 MB** | **1,287 MB** |
+
+The second total includes two renderers the first run did not have open, Synapse's own
+page (177 MB) and its window (36 MB).
+
 ## Things that are not fixed, and why
 
 ### Razer's filter driver, and driver mode

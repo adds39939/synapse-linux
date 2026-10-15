@@ -93,8 +93,8 @@ modules:
         url: https://dl.winehq.org/wine/source/11.x/wine-11.16.tar.xz
         sha256: c66e2090343dcd727f7f7fd2f87ee0bfb0b118790c1d745ab7b8a4c3a4197f2f
       # What each patch fixes, and why, is in docs/wine-fixes.md. 01-20 are the NZXT CAM
-      # series, unchanged; 21-25 are the ones Synapse needed on top. They are -p0
-      # patches, hence strip-components: 0.
+      # series, unchanged; 21-26 are the ones Synapse needed on top, and 27-29 cut how
+      # much memory it takes. They are -p0 patches, hence strip-components: 0.
       - type: patch
         path: ../patches/01-propsys-hid-properties.patch
         strip-components: 0
@@ -172,6 +172,15 @@ modules:
         strip-components: 0
       - type: patch
         path: ../patches/26-setupapi-present-devices-only.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/27-share-unaligned-image-sections.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/28-ntdll-disable-transparent-huge-pages.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/29-ntdll-sparse-page-protection-table.patch
         strip-components: 0
 
   # Needed by winetricks to unpack the corefonts and .NET cabs on first run.
