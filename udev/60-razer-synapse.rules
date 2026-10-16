@@ -7,10 +7,19 @@
 #
 #   sudo cp 60-razer-synapse.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules
-#   sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb
+#   sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb --subsystem-match=input --subsystem-match=misc
 #
-# Anything that already ships a rule for Razer's vendor id has covered this (OpenRGB
-# does, and OpenRazer covers the devices it supports), which is why the problem does
-# not show up on every machine.
+# Anything that already ships a rule for Razer's vendor id has covered the first two
+# lines (OpenRGB does, and OpenRazer covers the devices it supports), which is why the
+# problem does not show up on every machine.
 KERNEL=="hidraw*", ATTRS{idVendor}=="1532", MODE="0660", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTRS{idVendor}=="1532", MODE="0660", TAG+="uaccess"
+
+# Driver mode. Synapse remaps a device's buttons itself, the way Razer's filter driver
+# lets it on Windows: winebus takes the device's input events away from the desktop
+# while Synapse runs (an exclusive grab of its evdev nodes), hands Synapse the presses
+# it asks for, and sends what Synapse makes of them -- and everything it did not ask
+# for -- back out through a uinput device. That needs the device's event nodes, and
+# /dev/uinput, which some distributions (or Steam's rules) already open to the seat.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="1532", TAG+="uaccess"
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

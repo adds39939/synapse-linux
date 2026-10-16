@@ -10,19 +10,15 @@ configuring your Razer hardware directly.
 [![Wine](https://img.shields.io/badge/wine-11.16%20(bundled)-44d62c?style=flat-square&labelColor=1c1c1e)](WINE_VERSION)
 [![License](https://img.shields.io/badge/license-MIT%20%2B%20LGPL--2.1-6b7280?style=flat-square&labelColor=1c1c1e)](#licensing)
 
-[**Install**](#install) · [What works](#what-works) · [Start on login](#start-on-login) · [Build it yourself](#building-it-yourself) · [Troubleshooting](docs/troubleshooting.md)
+[**Install**](#install) · [What works](#what-works) · [Troubleshooting](docs/troubleshooting.md) · [How it works](docs/wine-fixes.md)
 
 </div>
 
 <br>
 
-This repository contains the Wine patches and the launcher that make Razer Synapse work on
-Linux: the patches so it finds your devices and talks to them over HID the way it does on
-Windows, and the launcher that sets up a prefix Razer's installer will run in.
-
-Nothing of Razer's is in here. The first run downloads Razer's installer from Razer, and
-you install Synapse from it exactly as you would on Windows — so you always get the
-current Synapse, and its updates come from Razer as usual.
+A Flatpak with a patched Wine and a launcher that make Razer Synapse work on Linux. Nothing
+of Razer's is in here: the first run downloads Razer's installer from Razer, and Synapse
+and its updates come from Razer as usual.
 
 <br>
 
@@ -41,171 +37,80 @@ battery level read from the mouse.</sub>
 
 ## Install
 
-**1. Install the Flatpak.** Build it as below, or download `synapse-linux.flatpak` from
-a release, then:
+1. Download `synapse-linux.flatpak` from a release (or [build it](#building-it-yourself)), and
+   install it:
 
-```bash
-flatpak install --user synapse-linux.flatpak
-```
+   ```bash
+   flatpak install --user synapse-linux.flatpak
+   ```
 
-**2. Install the udev rule.** This is the one step that needs root, and one you cannot skip.
+2. Install the udev rule — the one step that needs root. Without it Synapse finds no
+   devices and cannot remap their buttons:
 
-Razer devices stay owned by `root` until a udev rule says otherwise — without this Synapse
-starts and finds no devices.
+   ```bash
+   flatpak run --command=razer-synapse-setup io.github.adds39939.SynapseLinux --udev-rule \
+     | sudo tee /etc/udev/rules.d/60-razer-synapse.rules >/dev/null
+   sudo udevadm control --reload-rules
+   sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb \
+     --subsystem-match=input --subsystem-match=misc
+   ```
 
-```bash
-flatpak run --command=razer-synapse-setup io.github.adds39939.SynapseLinux --udev-rule \
-  | sudo tee /etc/udev/rules.d/60-razer-synapse.rules >/dev/null
+3. Start **Razer Synapse** from your application menu. The first run sets up the Wine
+   prefix, which takes a few minutes, then opens Razer's installer: choose **Install**.
 
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb
-```
-
-If you use OpenRGB, its rule already covers Razer's vendor id.
-
-**3. Start it**, from your application menu or with:
-
-```bash
-flatpak run io.github.adds39939.SynapseLinux
-```
-
-The first run takes several minutes before anything Razer appears: it builds the Wine
-prefix and installs Microsoft's core fonts and .NET Framework 4.8, which Razer's installer
-needs — all downloaded from Microsoft. Then Razer's installer opens. Choose **Install** for
-Razer Synapse, as you would on Windows; Synapse starts when it has finished.
-
-### Where everything lives
-
-Everything the app writes is in one directory,
-`~/.var/app/io.github.adds39939.SynapseLinux/`: the Wine prefix, and with it Synapse, its
-settings, profiles and logs.
-
-## Uninstall
-
-```bash
-flatpak uninstall --delete-data io.github.adds39939.SynapseLinux
-```
+Everything the app writes lives in `~/.var/app/io.github.adds39939.SynapseLinux/`. To
+remove it all: `flatpak uninstall --delete-data io.github.adds39939.SynapseLinux`.
 
 ## What works
 
-Verified with a **Naga V2 Pro** on its HyperSpeed receiver (`1532:00a8`):
+Verified with a **Naga V2 Pro** on its HyperSpeed receiver (`1532:00a8`), and a **Naga V3
+Pro** paired to a **Mouse Dock Pro** (`1532:00a4`):
 
 * ✅ **Razer's installer** — the current one, from Razer, installs Synapse 4 and the App
   Engine it runs on
 * ✅ **Synapse's own module install** — the drivers, lighting and mapping engines it
   fetches after first start
-* ✅ **The mouse and its receiver are detected**, with a battery level that updates live
+* ✅ **The mouse and its receiver are detected**, with battery level and charging state
+  that update live
 * ✅ **Device settings are read from the mouse** — sensitivity stages, polling rate,
   which side plate is fitted, lighting brightness and effect
-* ✅ **Changes are written back to the mouse** — a polling rate set in Synapse is what
-  OpenRazer reads back from it, and the mouse acknowledges each change
-* ✅ **Lighting** — effects chosen in Synapse show on the mouse, as do brightness changes.
-  Synapse 4 renders effects itself and streams them to the device, about eleven frames a
-  second
-* ✅ **Button assignments** — a side button set to another key sends that key everywhere
-  on the desktop, while Synapse runs and after it quits. The mouse's own firmware applies
-  them: Synapse stores every assignment on the mouse, and this build keeps the mouse in
-  normal mode so it uses them (see [patch 25](docs/wine-fixes.md))
-* ✅ **Changes made on the mouse show in Synapse** — stepping the sensitivity with the
-  DPI buttons moves Synapse's active stage, and switching the wheel's scroll mode moves
-  its scroll mode selector, as on Windows (see [patch 33](docs/wine-fixes.md))
+* ✅ **Changes are written back to the mouse**, and the mouse acknowledges each one
+* ✅ **Lighting** — effects and brightness chosen in Synapse show on the mouse
+* ✅ **Button assignments, as on Windows** — Synapse runs the mouse in driver mode and
+  remaps it on the PC: keys, the AI launcher, Synapse's wheel handling, all at the mouse's
+  8000 Hz ([how](docs/wine-fixes.md#35-razers-filter-driver-done-by-winebus))
+* ✅ **Pairing a mouse to the Mouse Dock Pro** from Synapse
 * ✅ **The window** — maximized, from Synapse's own button or by dragging it to the top
   of the screen, it fills the screen with only Synapse's own title bar
 * ✅ **The tray icon** — its menu opens on every right-click, and its flyout opens Synapse
-  from the tray
 * ✅ **Display scaling** matches your desktop's, so it is not tiny on a 4K panel
 
-## Untested
-
-* ❓ **Macros.** Synapse reports on-board macro memory for the Naga V2 Pro, so a macro
-  may be stored on the mouse and work like any other assignment; none have been tried.
-* ❓ **Hypershift** assignments, and the Scrolling, Power and Calibration pages.
-* ❓ **The Naga V3 Pro** (`1532:00e8`) is found and connected: Synapse installs its
-  module and reads its serial number, and the mouse acknowledges each command and stays
-  in normal mode. Lighting and button assignments on it have not been checked by eye yet.
-* ❓ **Any other Razer device.** Nothing here is specific to the Nagas — the fixes are to
-  device enumeration and Windows features Synapse relies on — so other devices may well
-  work, but none have been tried.
-* ❓ **Firmware updates.** Nothing here has ever written firmware to a device.
-
-## What doesn't
-
-* 🚫 **Assignments only Synapse itself can carry out** — launching a program, typing text,
-  Windows shortcuts. On Windows these go through Razer's filter driver, which Wine cannot
-  load, and what Synapse sends from inside Wine would reach only Windows programs.
-  Building that is possible but a project of its own; [`docs/wine-fixes.md`](docs/wine-fixes.md)
-  has what it would take.
-* 🚫 **Razer Game Manager Service** crashes under Wine: it detects games through Windows'
-  kernel event tracing, which Wine does not implement. It serves Linked Games and Cortex,
-  not devices.
-
-## Start on login
-
-Synapse's own *start with Windows* setting controls this, and it is on by default, as on
-Windows: the launcher mirrors it onto an autostart entry each time Synapse starts and
-stops. Synapse then starts in the tray. Quit Synapse first, then:
-
-```bash
-flatpak run --command=razer-synapse-autostart io.github.adds39939.SynapseLinux status
-flatpak run --command=razer-synapse-autostart io.github.adds39939.SynapseLinux remove   # or add
-```
-
-## Display scaling
-
-The launcher matches Wine's DPI to your desktop's, from the `Xft.dpi` your desktop gives
-its X clients. If it guesses wrong, set it:
-
-```bash
-flatpak override --user --env=RAZER_SYNAPSE_SCALE=1.5 io.github.adds39939.SynapseLinux
-```
+Not tried yet: macros, Hypershift, firmware updates, and other Razer devices — nothing
+here is specific to the Nagas. Razer Game Manager Service (Linked Games, Cortex) does not
+run under Wine.
 
 ## Notes
 
-* **OpenRazer** can be installed alongside. Both talk to the device over the same
-  channel, so while both run, one may read the other's replies; Synapse re-reads the
-  device as it starts. Stop the daemon while Synapse runs if you want Synapse to own the
-  device.
-* Closing Synapse's window sends it to the tray, as on Windows. Quit it from the tray menu.
-* What each Wine patch fixes, and why, is written up in
-  [`docs/wine-fixes.md`](docs/wine-fixes.md).
+* Synapse's *start with Windows* setting starts it in the tray on login.
+* If you use OpenRazer, keep its kernel modules off the devices Synapse runs, and stop its
+  daemon while Synapse runs — see [troubleshooting](docs/troubleshooting.md).
+* If the window is the wrong size for your display, set the scale yourself:
+  `flatpak override --user --env=RAZER_SYNAPSE_SCALE=1.5 io.github.adds39939.SynapseLinux`
 
 ## Building it yourself
 
 ```bash
 flatpak install -y flathub org.freedesktop.Platform//25.08 \
     org.freedesktop.Sdk//25.08 org.freedesktop.Sdk.Extension.mingw-w64//25.08
-
-flatpak-builder --user --install --force-clean \
-    build-dir flatpak/io.github.adds39939.SynapseLinux.yml
+flatpak-builder --user --install --force-clean build-dir flatpak/io.github.adds39939.SynapseLinux.yml
 ```
 
-That downloads Wine, applies every patch in `patches/`, builds it against the mingw-w64
-SDK extension, and installs the result. It takes a while — most of it is Wine. Nothing
-else has to be installed: the runtime and the SDK carry the compilers and the libraries.
-
-The patches are `-p0` patches against Wine 11.16 as upstream ships it: 01–26 and 31–34
-are what Synapse needs, and 27–30 cut how much memory it takes. To build against a
-different Wine, change the `url` and `sha256` in the manifest's `wine` module and put the
-same version in [`WINE_VERSION`](WINE_VERSION) — CI checks the two agree.
-
-Patches 21–24, 26, 31, 32 and 34 are not Synapse-specific: they fix gaps that affect any
-application that walks its child processes, verifies MSIX packages, pairs a USB device
-with its HID interfaces, shrinks a window to nothing, lists HID devices hidapi's way after
-one has been unplugged, draws its own window frame, shows a menu from a tray icon, or
-creates a message-only window while Wine is still starting up. 25
-and 33 are the exception, by design — they keep Razer devices in the mode their firmware
-applies their own assignments in, and pass on what the firmware then changes by itself,
-which only makes sense where no Razer filter driver can run.
+This builds Wine 11.16 with the patches in [`patches/`](patches) — what each one fixes is
+in [`docs/wine-fixes.md`](docs/wine-fixes.md).
 
 ## Licensing
 
-This repository's scripts, patches, manifest and docs are MIT (see `LICENSE`).
-
-The Wine inside the Flatpak bundle is compiled from patched Wine sources and is therefore
-an **LGPL-2.1-or-later** derivative work of Wine — see `NOTICE` for the
-corresponding-source pointers. It is built from the manifest and the patches in this
-repository, and no binaries are committed here.
-
-No Razer code or artwork is redistributed here — the app downloads Razer's installer from
-Razer, and the icon is this project's own. "Razer" and "Synapse" are Razer's trademarks;
-this project is unaffiliated with Razer and not endorsed by it.
+This repository is MIT (see `LICENSE`). The Wine in the Flatpak is built from the patched
+Wine sources here and is LGPL-2.1-or-later (see `NOTICE`). No Razer code or artwork is
+included; "Razer" and "Synapse" are Razer's trademarks, and this project is not affiliated
+with or endorsed by Razer.

@@ -1,0 +1,2504 @@
+diff --git dlls/winebus.sys/Makefile.in dlls/winebus.sys/Makefile.in
+index c2823e1..72317d0 100644
+--- dlls/winebus.sys/Makefile.in
++++ dlls/winebus.sys/Makefile.in
+@@ -12,5 +12,7 @@ SOURCES = \
+ 	bus_udev.c \
+ 	hid.c \
+ 	main.c \
++	razer.c \
++	razer_unix.c \
+ 	unixlib.c \
+ 	winebus.rc
+diff --git dlls/winebus.sys/bus_udev.c dlls/winebus.sys/bus_udev.c
+index 6c9ff6a..2757722 100644
+--- dlls/winebus.sys/bus_udev.c
++++ dlls/winebus.sys/bus_udev.c
+@@ -117,6 +117,7 @@ static inline struct base_device *impl_from_unix_device(struct unix_device *ifac
+ struct hidraw_device
+ {
+     struct base_device base;
++    struct razer_filter *razer;     /* the device's Razer filter, see razer_unix.c */
+ };
+ 
+ static inline struct hidraw_device *hidraw_impl_from_unix_device(struct unix_device *iface)
+@@ -266,6 +267,41 @@ static void start_polling_device(struct unix_device *iface)
+     }
+ }
+ 
++/* A file descriptor polled for razer_unix.c rather than for a device, which takes it
++ * over: it is closed once it is no longer polled. */
++BOOL udev_watch_fd(int fd)
++{
++    if (poll_count >= ARRAY_SIZE(poll_fds))
++    {
++        ERR("could not start polling fd %d, too many fds\n", fd);
++        return FALSE;
++    }
++    poll_devs[poll_count] = NULL;
++    poll_fds[poll_count].fd = fd;
++    poll_fds[poll_count].events = POLLIN;
++    poll_fds[poll_count].revents = 0;
++    poll_count++;
++    write(deviceloop_control[1], "u", 1);
++    return TRUE;
++}
++
++void udev_unwatch_fd(int fd)
++{
++    int i;
++
++    for (i = 2; i < poll_count; ++i)
++        if (poll_fds[i].fd == fd && !poll_devs[i]) break;
++    if (i < poll_count)
++    {
++        poll_count--;
++        poll_fds[i] = poll_fds[poll_count];
++        poll_devs[i] = poll_devs[poll_count];
++    }
++    if (close_count < ARRAY_SIZE(close_fds)) close_fds[close_count++] = fd;
++    else close(fd);
++    write(deviceloop_control[1], "u", 1);
++}
++
+ static struct base_device *find_device_from_fd(int fd)
+ {
+     int i;
+@@ -308,6 +344,12 @@ static void hidraw_device_stop(struct unix_device *iface)
+     pthread_mutex_lock(&udev_cs);
+     stop_polling_device(iface);
+     list_remove(&impl->base.unix_device.entry);
++    if (impl->razer)
++    {
++        razer_filter_release(impl->razer, &event_queue);
++        impl->razer = NULL;
++        write(deviceloop_control[1], "u", 1);
++    }
+     pthread_mutex_unlock(&udev_cs);
+ }
+ 
+@@ -1222,6 +1264,8 @@ static NTSTATUS hidraw_device_create(struct udev_device *dev, int fd, const char
+ 
+     if (!(impl = raw_device_create(&hidraw_device_vtbl, sizeof(struct hidraw_device))))
+         return STATUS_NO_MEMORY;
++    if (desc.vid == 0x1532 && desc.bus_type == BUS_TYPE_USB)
++        ((struct hidraw_device *)impl)->razer = razer_filter_add(udev_context, dev, &desc, &event_queue);
+     list_add_tail(&device_list, &impl->unix_device.entry);
+     impl->read_report = hidraw_device_read_report;
+     impl->udev_device = udev_device_ref(dev);
+@@ -1846,9 +1890,14 @@ NTSTATUS udev_bus_wait(void *args)
+ 
+     while (ctrl != 'q')
+     {
+-        if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
+-
++        /* the Razer filter may queue an event from another thread, with the lock held */
+         pthread_mutex_lock(&udev_cs);
++        if (bus_event_queue_pop(&event_queue, result))
++        {
++            pthread_mutex_unlock(&udev_cs);
++            return STATUS_PENDING;
++        }
++
+         while (close_count--) close(close_fds[close_count]);
+         memcpy(pfd, poll_fds, poll_count * sizeof(*pfd));
+         count = poll_count;
+@@ -1871,12 +1920,18 @@ NTSTATUS udev_bus_wait(void *args)
+             if (!pfd[i].revents) continue;
+             impl = find_device_from_fd(pfd[i].fd);
+             if (impl) impl->read_report(&impl->unix_device);
++            else razer_filter_read(pfd[i].fd, &event_queue);
+         }
+         pthread_mutex_unlock(&udev_cs);
+     }
+ 
+     TRACE("UDEV main loop exiting\n");
++    pthread_mutex_lock(&udev_cs);
++    razer_filter_shutdown();
++    while (close_count--) close(close_fds[close_count]);
++    close_count = 0;
+     bus_event_queue_destroy(&event_queue);
++    pthread_mutex_unlock(&udev_cs);
+     if (udev_monitor) udev_monitor_unref(udev_monitor);
+     udev_unref(udev_context);
+     udev_context = NULL;
+@@ -1892,6 +1947,16 @@ NTSTATUS udev_bus_stop(void *args)
+     return STATUS_SUCCESS;
+ }
+ 
++NTSTATUS udev_razer_ioctl(void *args)
++{
++    NTSTATUS status;
++
++    pthread_mutex_lock(&udev_cs);
++    status = razer_filter_ioctl(args);
++    pthread_mutex_unlock(&udev_cs);
++    return status;
++}
++
+ #else
+ 
+ NTSTATUS udev_bus_init(void *args)
+@@ -1912,4 +1977,9 @@ NTSTATUS udev_bus_stop(void *args)
+     return STATUS_NOT_IMPLEMENTED;
+ }
+ 
++NTSTATUS udev_razer_ioctl(void *args)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
+ #endif /* HAVE_UDEV */
+diff --git dlls/winebus.sys/main.c dlls/winebus.sys/main.c
+index 1515b66..2cbbc2d 100644
+--- dlls/winebus.sys/main.c
++++ dlls/winebus.sys/main.c
+@@ -496,10 +496,12 @@ __ASM_STDCALL_FUNC(wrap_fastcall_func1, 8,
+ static NTSTATUS build_device_relations(DEVICE_RELATIONS **devices)
+ {
+     struct device_extension *ext;
+-    int i;
++    ULONG razer_count;
++    int i, j;
+ 
+     RtlEnterCriticalSection(&device_list_cs);
+-    *devices = ExAllocatePool(PagedPool, offsetof(DEVICE_RELATIONS, Objects[list_count(&device_list)]));
++    razer_count = razer_control_count();
++    *devices = ExAllocatePool(PagedPool, offsetof(DEVICE_RELATIONS, Objects[list_count(&device_list) + razer_count]));
+ 
+     if (!*devices)
+     {
+@@ -514,6 +516,8 @@ static NTSTATUS build_device_relations(DEVICE_RELATIONS **devices)
+         call_fastcall_func1(ObfReferenceObject, ext->device);
+         i++;
+     }
++    for (j = i, i += razer_control_get_relations((*devices)->Objects + i, razer_count); j < i; j++)
++        call_fastcall_func1(ObfReferenceObject, (*devices)->Objects[j]);
+     RtlLeaveCriticalSection(&device_list_cs);
+     (*devices)->Count = i;
+     return STATUS_SUCCESS;
+@@ -1026,6 +1030,17 @@ static DWORD CALLBACK bus_main_thread(void *args)
+             else process_hid_report(device, event->input_report.buffer, event->input_report.length);
+             RtlLeaveCriticalSection(&device_list_cs);
+             break;
++        case BUS_EVENT_TYPE_RAZER_CREATED:
++            if (!razer_control_create(driver_obj, event->device, &event->device_created.desc))
++                IoInvalidateDeviceRelations(bus_pdo, BusRelations);
++            break;
++        case BUS_EVENT_TYPE_RAZER_REMOVED:
++            razer_control_unlink(event->device);
++            IoInvalidateDeviceRelations(bus_pdo, BusRelations);
++            break;
++        case BUS_EVENT_TYPE_RAZER_EVENT:
++            razer_control_event(event->device, &event->razer_event);
++            break;
+         }
+     }
+ 
+@@ -1464,6 +1479,8 @@ static NTSTATUS WINAPI common_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
+ {
+     if (device == bus_fdo)
+         return fdo_pnp_dispatch(device, irp);
++    if (razer_is_control(device))
++        return razer_control_pnp(device, irp);
+     return pdo_pnp_dispatch(device, irp);
+ }
+ 
+@@ -1749,6 +1766,10 @@ NTSTATUS WINAPI DriverEntry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
+ 
+     driver->MajorFunction[IRP_MJ_PNP] = common_pnp_dispatch;
+     driver->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = hid_internal_dispatch;
++    /* only Razer control devices are opened directly, see razer.c */
++    driver->MajorFunction[IRP_MJ_CREATE] = razer_dispatch_create;
++    driver->MajorFunction[IRP_MJ_CLOSE] = razer_dispatch_close;
++    driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = razer_dispatch_ioctl;
+     driver->DriverExtension->AddDevice = driver_add_device;
+     driver->DriverUnload = driver_unload;
+ 
+diff --git dlls/winebus.sys/razer.c dlls/winebus.sys/razer.c
+new file mode 100644
+index 0000000..3ee5e11
+--- /dev/null
++++ dlls/winebus.sys/razer.c
+@@ -0,0 +1,628 @@
++/*
++ * Razer input filter emulation: the Razer Control Device
++ *
++ * Copyright 2026 adds39939
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "winioctl.h"
++#include "hidusage.h"
++#include "ddk/wdm.h"
++#include "ddk/hidtypes.h"
++#include "wine/debug.h"
++#include "wine/list.h"
++#include "wine/unixlib.h"
++
++#include "unixlib.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(razer);
++
++/* See razer.h. One control device stands for one Razer USB device, as a raw device of the
++ * bus: no driver is installed for it. Its device ID and container ID are what Synapse's
++ * mapping engine goes by to tell which device it belongs to -- the PID in the interface
++ * path, and the container ID of the device's HID collections. */
++
++static const GUID razer_control_interface = {0xe3be005d, 0xd130, 0x4910, {0x88, 0xff, 0x09, 0xae, 0x02, 0xf6, 0x80, 0xe9}};
++
++#define RAZER_CLIENT_QUEUE 128
++
++struct razer_control;
++
++/* an open handle */
++struct razer_client
++{
++    struct list entry;
++    struct razer_control *control;
++    UINT subscriptions;                 /* RAZER_EVENT_* */
++    UINT redirects;                     /* the input types it has redirected, 1 << type */
++    LIST_ENTRY reads;                   /* pending IOCTL_RAZER_READ_EVENT */
++    UINT first, count;
++    struct razer_event events[RAZER_CLIENT_QUEUE];
++};
++
++struct razer_control
++{
++    struct list entry;
++    DEVICE_OBJECT *device;
++    UINT64 filter;
++    struct device_desc desc;
++    UNICODE_STRING link;
++    BOOL linked;                        /* among the bus' children */
++    BOOL removed;                       /* surprise removed or removed: no more requests */
++    BOOL deleted;                       /* removed, and its device object deleted */
++    UINT subscriptions;                 /* the last told to the Unix side */
++    struct list clients;
++};
++
++/* A control is freed once it is both removed and has no open handle left. Wine sends no
++ * IRP_MJ_CLEANUP, only IRP_MJ_CLOSE, and none at all for a handle still open when the
++ * device is deleted: such a handle's client is never freed. */
++
++static CRITICAL_SECTION razer_cs;
++static CRITICAL_SECTION_DEBUG razer_cs_debug =
++{
++    0, 0, &razer_cs,
++    { &razer_cs_debug.ProcessLocksList, &razer_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": razer_cs") }
++};
++static CRITICAL_SECTION razer_cs = { &razer_cs_debug, -1, 0, 0, 0, 0 };
++
++static struct list controls = LIST_INIT(controls);
++
++static NTSTATUS filter_ioctl(struct razer_control *control, UINT code, const void *in, UINT in_size,
++                             void *out, UINT out_size, UINT *out_len)
++{
++    struct razer_ioctl_params params =
++    {
++        .filter = control->filter,
++        .code = code,
++        .in = in,
++        .in_size = in_size,
++        .out = out,
++        .out_size = out_size,
++    };
++    NTSTATUS status = WINE_UNIX_CALL(razer_ioctl, &params);
++    if (out_len) *out_len = params.out_len;
++    return status;
++}
++
++static struct razer_control *find_control(DEVICE_OBJECT *device)
++{
++    struct razer_control *control;
++
++    LIST_FOR_EACH_ENTRY(control, &controls, struct razer_control, entry)
++        if (control->device == device) return control;
++    return NULL;
++}
++
++/* tell the Unix side what the handles want, with razer_cs held */
++static void update_subscriptions(struct razer_control *control)
++{
++    struct razer_client *client;
++    UINT subscriptions = 0;
++
++    LIST_FOR_EACH_ENTRY(client, &control->clients, struct razer_client, entry)
++        subscriptions |= client->subscriptions;
++    if (subscriptions == control->subscriptions || control->removed) return;
++
++    TRACE("control %p subscriptions %#x\n", control, subscriptions);
++    control->subscriptions = subscriptions;
++    filter_ioctl(control, RAZER_SET_SUBSCRIPTIONS, &subscriptions, sizeof(subscriptions), NULL, 0, NULL);
++}
++
++NTSTATUS razer_control_create(DRIVER_OBJECT *driver, UINT64 filter, const struct device_desc *desc)
++{
++    struct razer_control *control;
++    DEVICE_OBJECT *device;
++    UNICODE_STRING nameW;
++    WCHAR name[64];
++    NTSTATUS status;
++
++    if (!(control = calloc(1, sizeof(*control)))) return STATUS_NO_MEMORY;
++
++    swprintf(name, ARRAY_SIZE(name), L"\\Device\\RZCONTROL#%I64x", filter);
++    RtlInitUnicodeString(&nameW, name);
++    if ((status = IoCreateDevice(driver, sizeof(control), &nameW, FILE_DEVICE_UNKNOWN, 0, FALSE, &device)))
++    {
++        ERR("failed to create a control device for %04x:%04x, status %#lx\n", desc->vid, desc->pid, status);
++        free(control);
++        return status;
++    }
++
++    *(struct razer_control **)device->DeviceExtension = control;
++    control->device = device;
++    control->filter = filter;
++    control->desc = *desc;
++    control->linked = TRUE;
++    list_init(&control->clients);
++
++    EnterCriticalSection(&razer_cs);
++    list_add_tail(&controls, &control->entry);
++    LeaveCriticalSection(&razer_cs);
++
++    TRACE("control %p for %04x:%04x, filter %#I64x\n", control, desc->vid, desc->pid, filter);
++    return STATUS_SUCCESS;
++}
++
++void razer_control_unlink(UINT64 filter)
++{
++    struct razer_control *control;
++
++    EnterCriticalSection(&razer_cs);
++    LIST_FOR_EACH_ENTRY(control, &controls, struct razer_control, entry)
++        if (control->filter == filter) control->linked = FALSE;
++    LeaveCriticalSection(&razer_cs);
++}
++
++ULONG razer_control_count(void)
++{
++    struct razer_control *control;
++    ULONG count = 0;
++
++    EnterCriticalSection(&razer_cs);
++    LIST_FOR_EACH_ENTRY(control, &controls, struct razer_control, entry)
++        if (control->linked) count++;
++    LeaveCriticalSection(&razer_cs);
++    return count;
++}
++
++ULONG razer_control_get_relations(DEVICE_OBJECT **devices, ULONG count)
++{
++    struct razer_control *control;
++    ULONG i = 0;
++
++    EnterCriticalSection(&razer_cs);
++    LIST_FOR_EACH_ENTRY(control, &controls, struct razer_control, entry)
++        if (control->linked && i < count) devices[i++] = control->device;
++    LeaveCriticalSection(&razer_cs);
++    return i;
++}
++
++BOOL razer_is_control(DEVICE_OBJECT *device)
++{
++    BOOL ret;
++
++    if (device->DeviceType != FILE_DEVICE_UNKNOWN) return FALSE;
++    EnterCriticalSection(&razer_cs);
++    ret = find_control(device) != NULL;
++    LeaveCriticalSection(&razer_cs);
++    return ret;
++}
++
++static void WINAPI read_cancel_routine(DEVICE_OBJECT *device, IRP *irp)
++{
++    TRACE("cancel %p\n", irp);
++    IoReleaseCancelSpinLock(irp->CancelIrql);
++
++    EnterCriticalSection(&razer_cs);
++    RemoveEntryList(&irp->Tail.Overlay.ListEntry);
++    LeaveCriticalSection(&razer_cs);
++
++    irp->IoStatus.Status = STATUS_CANCELLED;
++    irp->IoStatus.Information = 0;
++    IoCompleteRequest(irp, IO_NO_INCREMENT);
++}
++
++/* a pending read, with razer_cs held */
++static IRP *pop_read(struct razer_client *client)
++{
++    LIST_ENTRY *entry;
++    IRP *irp;
++
++    while ((entry = RemoveHeadList(&client->reads)) != &client->reads)
++    {
++        irp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
++        if (IoSetCancelRoutine(irp, NULL)) return irp;
++        /* being cancelled: the cancel routine completes it */
++        InitializeListHead(&irp->Tail.Overlay.ListEntry);
++    }
++    return NULL;
++}
++
++static void complete_reads(struct razer_client *client, NTSTATUS status)
++{
++    IRP *irp;
++
++    EnterCriticalSection(&razer_cs);
++    while ((irp = pop_read(client)))
++    {
++        LeaveCriticalSection(&razer_cs);
++        irp->IoStatus.Status = status;
++        irp->IoStatus.Information = 0;
++        IoCompleteRequest(irp, IO_NO_INCREMENT);
++        EnterCriticalSection(&razer_cs);
++    }
++    LeaveCriticalSection(&razer_cs);
++}
++
++void razer_control_event(UINT64 filter, const struct razer_event *event)
++{
++    struct razer_control *control;
++    struct razer_client *client;
++    IRP *irps[16];
++    UINT i, count = 0;
++
++    EnterCriticalSection(&razer_cs);
++    LIST_FOR_EACH_ENTRY(control, &controls, struct razer_control, entry)
++    {
++        if (control->filter != filter) continue;
++        LIST_FOR_EACH_ENTRY(client, &control->clients, struct razer_client, entry)
++        {
++            IRP *irp;
++
++            if (!(client->subscriptions & event->kind)) continue;
++            if (count < ARRAY_SIZE(irps) && (irp = pop_read(client)))
++            {
++                memcpy(irp->AssociatedIrp.SystemBuffer, event, sizeof(*event));
++                irp->IoStatus.Status = STATUS_SUCCESS;
++                irp->IoStatus.Information = sizeof(*event);
++                irps[count++] = irp;
++                continue;
++            }
++            if (client->count == RAZER_CLIENT_QUEUE)
++            {
++                WARN("client %p queue full, dropping an event\n", client);
++                client->first = (client->first + 1) % RAZER_CLIENT_QUEUE;
++                client->count--;
++            }
++            client->events[(client->first + client->count++) % RAZER_CLIENT_QUEUE] = *event;
++        }
++    }
++    LeaveCriticalSection(&razer_cs);
++
++    for (i = 0; i < count; i++) IoCompleteRequest(irps[i], IO_NO_INCREMENT);
++}
++
++static WCHAR *alloc_string(const WCHAR *str, SIZE_T len)
++{
++    WCHAR *dst;
++
++    if ((dst = ExAllocatePool(PagedPool, (len + 1) * sizeof(WCHAR))))
++    {
++        memcpy(dst, str, len * sizeof(WCHAR));
++        dst[len] = 0;
++    }
++    return dst;
++}
++
++static NTSTATUS query_id(struct razer_control *control, IRP *irp, BUS_QUERY_ID_TYPE type)
++{
++    const GUID *guid = &control->desc.container_id;
++    WCHAR buffer[MAX_PATH];
++    SIZE_T len = 0;
++
++    switch (type)
++    {
++    case BusQueryDeviceID:
++    case BusQueryHardwareIDs:
++        /* what RzDev_<pid>.sys names its control devices; Razer's RzCommon.sys only binds to
++         * them through a compatible ID, RAZER\DeviceContol, which is left out */
++        len = swprintf(buffer, ARRAY_SIZE(buffer), L"RZCONTROL\\VID_%04X&PID_%04X&MI_00",
++                       control->desc.vid, control->desc.pid) + 1;
++        if (type == BusQueryHardwareIDs) buffer[len++] = 0;
++        break;
++    case BusQueryCompatibleIDs:
++        buffer[len++] = 0;
++        break;
++    case BusQueryInstanceID:
++        len = swprintf(buffer, ARRAY_SIZE(buffer), L"%X&%X&%02X%02X%02X%02X%02X%02X%02X%02X",
++                       guid->Data2, guid->Data3, guid->Data4[0], guid->Data4[1], guid->Data4[2],
++                       guid->Data4[3], guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]) + 1;
++        break;
++    case BusQueryContainerID:
++        len = swprintf(buffer, ARRAY_SIZE(buffer), L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
++                       guid->Data1, guid->Data2, guid->Data3, guid->Data4[0], guid->Data4[1], guid->Data4[2],
++                       guid->Data4[3], guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]) + 1;
++        break;
++    default:
++        return irp->IoStatus.Status;
++    }
++
++    if (!(irp->IoStatus.Information = (ULONG_PTR)alloc_string(buffer, len))) return STATUS_NO_MEMORY;
++    TRACE("control %p id %u %s\n", control, type, debugstr_w(buffer));
++    return STATUS_SUCCESS;
++}
++
++static void control_disable(struct razer_control *control)
++{
++    struct razer_client *client;
++    LIST_ENTRY irps, *entry;
++    IRP *irp;
++
++    InitializeListHead(&irps);
++    EnterCriticalSection(&razer_cs);
++    control->removed = TRUE;
++    LIST_FOR_EACH_ENTRY(client, &control->clients, struct razer_client, entry)
++        while ((irp = pop_read(client))) InsertTailList(&irps, &irp->Tail.Overlay.ListEntry);
++    LeaveCriticalSection(&razer_cs);
++
++    if (control->link.Buffer) IoSetDeviceInterfaceState(&control->link, FALSE);
++    while ((entry = RemoveHeadList(&irps)) != &irps)
++    {
++        irp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
++        irp->IoStatus.Status = STATUS_DELETE_PENDING;
++        irp->IoStatus.Information = 0;
++        IoCompleteRequest(irp, IO_NO_INCREMENT);
++    }
++}
++
++NTSTATUS razer_control_pnp(DEVICE_OBJECT *device, IRP *irp)
++{
++    IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation(irp);
++    struct razer_control *control = *(struct razer_control **)device->DeviceExtension;
++    NTSTATUS status = irp->IoStatus.Status;
++    DEVICE_CAPABILITIES *caps;
++    BOOL free_control;
++
++    TRACE("control %p, minor function %#x\n", control, irpsp->MinorFunction);
++
++    switch (irpsp->MinorFunction)
++    {
++    case IRP_MN_QUERY_ID:
++        status = query_id(control, irp, irpsp->Parameters.QueryId.IdType);
++        break;
++
++    case IRP_MN_QUERY_DEVICE_TEXT:
++        if (irpsp->Parameters.QueryDeviceText.DeviceTextType != DeviceTextDescription) break;
++        if (!(irp->IoStatus.Information = (ULONG_PTR)alloc_string(L"Razer Control Device", 20))) status = STATUS_NO_MEMORY;
++        else status = STATUS_SUCCESS;
++        break;
++
++    case IRP_MN_QUERY_CAPABILITIES:
++        caps = irpsp->Parameters.DeviceCapabilities.Capabilities;
++        caps->RawDeviceOK = 1;
++        caps->SilentInstall = 1;
++        caps->SurpriseRemovalOK = 1;
++        status = STATUS_SUCCESS;
++        break;
++
++    case IRP_MN_START_DEVICE:
++        status = STATUS_SUCCESS;
++        if (!control->link.Buffer &&
++            (status = IoRegisterDeviceInterface(device, &razer_control_interface, NULL, &control->link)))
++            ERR("failed to register the control device interface, status %#lx\n", status);
++        else if ((status = IoSetDeviceInterfaceState(&control->link, TRUE)))
++            ERR("failed to enable the control device interface, status %#lx\n", status);
++        else
++            TRACE("control %p is %s\n", control, debugstr_w(control->link.Buffer));
++        break;
++
++    case IRP_MN_SURPRISE_REMOVAL:
++        control_disable(control);
++        status = STATUS_SUCCESS;
++        break;
++
++    case IRP_MN_REMOVE_DEVICE:
++        control_disable(control);
++
++        EnterCriticalSection(&razer_cs);
++        list_remove(&control->entry);
++        RtlFreeUnicodeString(&control->link);
++        control->deleted = TRUE;
++        free_control = list_empty(&control->clients);
++        LeaveCriticalSection(&razer_cs);
++
++        if (free_control) free(control);
++
++        irp->IoStatus.Status = STATUS_SUCCESS;
++        IoCompleteRequest(irp, IO_NO_INCREMENT);
++        IoDeleteDevice(device);
++        return STATUS_SUCCESS;
++
++    default:
++        break;
++    }
++
++    irp->IoStatus.Status = status;
++    IoCompleteRequest(irp, IO_NO_INCREMENT);
++    return status;
++}
++
++static NTSTATUS complete(IRP *irp, NTSTATUS status, ULONG_PTR information)
++{
++    irp->IoStatus.Status = status;
++    irp->IoStatus.Information = information;
++    IoCompleteRequest(irp, IO_NO_INCREMENT);
++    return status;
++}
++
++NTSTATUS WINAPI razer_dispatch_create(DEVICE_OBJECT *device, IRP *irp)
++{
++    IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation(irp);
++    struct razer_control *control;
++    struct razer_client *client;
++
++    EnterCriticalSection(&razer_cs);
++    if (device->DeviceType != FILE_DEVICE_UNKNOWN || !(control = find_control(device)))
++    {
++        LeaveCriticalSection(&razer_cs);
++        return complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
++    }
++    if (control->removed || !(client = calloc(1, sizeof(*client))))
++    {
++        LeaveCriticalSection(&razer_cs);
++        return complete(irp, control->removed ? STATUS_DELETE_PENDING : STATUS_NO_MEMORY, 0);
++    }
++
++    client->control = control;
++    InitializeListHead(&client->reads);
++    list_add_tail(&control->clients, &client->entry);
++    irpsp->FileObject->FsContext = client;
++    LeaveCriticalSection(&razer_cs);
++
++    TRACE("control %p, client %p\n", control, client);
++    return complete(irp, STATUS_SUCCESS, 0);
++}
++
++NTSTATUS WINAPI razer_dispatch_close(DEVICE_OBJECT *device, IRP *irp)
++{
++    IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation(irp);
++    struct razer_client *client = irpsp->FileObject ? irpsp->FileObject->FsContext : NULL;
++    struct razer_control *control;
++    BOOL last, free_control = FALSE;
++
++    if (!client) return complete(irp, STATUS_SUCCESS, 0);
++    control = client->control;
++
++    TRACE("client %p\n", client);
++    complete_reads(client, STATUS_CANCELLED);
++
++    EnterCriticalSection(&razer_cs);
++    list_remove(&client->entry);
++    last = list_empty(&control->clients);
++    if (last && control->deleted) free_control = TRUE;
++    else if (last && !control->removed)
++    {
++        control->subscriptions = 0;
++        filter_ioctl(control, RAZER_RESET, NULL, 0, NULL, 0, NULL);
++    }
++    else if (!last) update_subscriptions(control);
++    LeaveCriticalSection(&razer_cs);
++
++    irpsp->FileObject->FsContext = NULL;
++    free(client);
++    if (free_control) free(control);
++    return complete(irp, STATUS_SUCCESS, 0);
++}
++
++static NTSTATUS read_event(struct razer_client *client, IRP *irp, ULONG out_size)
++{
++    if (out_size < sizeof(struct razer_event)) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
++
++    EnterCriticalSection(&razer_cs);
++    if (client->control->removed)
++    {
++        LeaveCriticalSection(&razer_cs);
++        return complete(irp, STATUS_DELETE_PENDING, 0);
++    }
++    if (client->count)
++    {
++        memcpy(irp->AssociatedIrp.SystemBuffer, &client->events[client->first], sizeof(struct razer_event));
++        client->first = (client->first + 1) % RAZER_CLIENT_QUEUE;
++        client->count--;
++        LeaveCriticalSection(&razer_cs);
++        return complete(irp, STATUS_SUCCESS, sizeof(struct razer_event));
++    }
++
++    IoSetCancelRoutine(irp, read_cancel_routine);
++    if (irp->Cancel && IoSetCancelRoutine(irp, NULL))
++    {
++        LeaveCriticalSection(&razer_cs);
++        return complete(irp, STATUS_CANCELLED, 0);
++    }
++    InsertTailList(&client->reads, &irp->Tail.Overlay.ListEntry);
++    irp->IoStatus.Status = STATUS_PENDING;
++    IoMarkIrpPending(irp);
++    LeaveCriticalSection(&razer_cs);
++    return STATUS_PENDING;
++}
++
++/* which handles get which events, set per handle */
++static NTSTATUS subscribe(struct razer_client *client, UINT kind, const void *in, ULONG in_size)
++{
++    if (in_size < 1) return STATUS_INVALID_PARAMETER;
++
++    EnterCriticalSection(&razer_cs);
++    if (*(BYTE *)in) client->subscriptions |= kind;
++    else client->subscriptions &= ~kind;
++    TRACE("client %p subscriptions %#x\n", client, client->subscriptions);
++    update_subscriptions(client->control);
++    LeaveCriticalSection(&razer_cs);
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS WINAPI razer_dispatch_ioctl(DEVICE_OBJECT *device, IRP *irp)
++{
++    IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation(irp);
++    struct razer_client *client = irpsp->FileObject ? irpsp->FileObject->FsContext : NULL;
++    ULONG code = irpsp->Parameters.DeviceIoControl.IoControlCode;
++    ULONG in_size = irpsp->Parameters.DeviceIoControl.InputBufferLength;
++    ULONG out_size = irpsp->Parameters.DeviceIoControl.OutputBufferLength;
++    void *buffer = irp->AssociatedIrp.SystemBuffer;
++    struct razer_redirect redirect;
++    NTSTATUS status;
++    UINT out_len = 0;
++
++    if (!client) return complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
++    if (client->control->removed) return complete(irp, STATUS_DELETE_PENDING, 0);
++    /* every request RzCommon.sys takes is METHOD_BUFFERED */
++    if ((code & 3) != METHOD_BUFFERED) return complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
++
++    switch (code)
++    {
++    case IOCTL_RAZER_READ_EVENT:
++        return read_event(client, irp, out_size);
++
++    case IOCTL_RAZER_RECEIVE_HOOKS:
++        return complete(irp, subscribe(client, RAZER_EVENT_HOOK, buffer, in_size), 0);
++    case IOCTL_RAZER_RECEIVE_NOTIFY:
++        return complete(irp, subscribe(client, RAZER_EVENT_NOTIFY, buffer, in_size), 0);
++    case IOCTL_RAZER_RECEIVE_OTHER:
++        return complete(irp, subscribe(client, RAZER_EVENT_OTHER, buffer, in_size), 0);
++
++    case IOCTL_RAZER_SET_REDIRECT:
++        if (in_size < sizeof(redirect)) return complete(irp, STATUS_INVALID_PARAMETER, 0);
++        memcpy(&redirect, buffer, sizeof(redirect));
++        if (redirect.type >= 32) return complete(irp, STATUS_INVALID_PARAMETER, 0);
++        status = filter_ioctl(client->control, code, &redirect, sizeof(redirect), NULL, 0, NULL);
++        if (!status)
++        {
++            BYTE any;
++            EnterCriticalSection(&razer_cs);
++            if (redirect.enable) client->redirects |= 1u << redirect.type;
++            else client->redirects &= ~(1u << redirect.type);
++            any = !!client->redirects;
++            LeaveCriticalSection(&razer_cs);
++            status = subscribe(client, RAZER_EVENT_REDIRECT, &any, sizeof(any));
++        }
++        return complete(irp, status, 0);
++
++    case IOCTL_RAZER_IS_OPEN:
++        if (out_size < 1) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
++        *(BYTE *)buffer = 1;
++        return complete(irp, STATUS_SUCCESS, 1);
++
++    case IOCTL_RAZER_GET_CONSUMER_STATE:
++        if (out_size < 256) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
++        memset(buffer, 0, 256);
++        return complete(irp, STATUS_SUCCESS, 256);
++
++    case IOCTL_RAZER_SET_HOOKS_ENABLED:
++    case IOCTL_RAZER_SEND_INPUT:
++    case IOCTL_RAZER_ADD_HOOK:
++    case IOCTL_RAZER_FIND_HOOK:
++    case IOCTL_RAZER_REMOVE_HOOK:
++    case IOCTL_RAZER_GET_HOOK:
++        status = filter_ioctl(client->control, code, buffer, in_size, buffer, out_size, &out_len);
++        if (status) TRACE("ioctl %#lx, status %#lx\n", code, status);
++        return complete(irp, status, out_len);
++
++    default:
++        /* RzCommon.sys hands the rest to the device's own driver; those it does not know
++         * end up answered with nothing to say */
++        FIXME("unhandled ioctl %#lx, in %lu, out %lu\n", code, in_size, out_size);
++        if (buffer && out_size) memset(buffer, 0, out_size);
++        return complete(irp, STATUS_SUCCESS, out_size);
++    }
++}
+diff --git dlls/winebus.sys/razer.h dlls/winebus.sys/razer.h
+new file mode 100644
+index 0000000..a3a2803
+--- /dev/null
++++ dlls/winebus.sys/razer.h
+@@ -0,0 +1,228 @@
++/*
++ * Razer input filter emulation, shared by winebus.sys and its Unix library
++ *
++ * Copyright 2026 adds39939
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINEBUS_RAZER_H
++#define __WINEBUS_RAZER_H
++
++/* On Windows, Razer Synapse puts a device in "driver mode", where its firmware no longer
++ * applies the button assignments stored in it and sends every button's default input
++ * instead, and remaps the device on the PC. Two kernel drivers make that possible:
++ * RzDev_<pid>.sys, a KMDF filter on the device's HID keyboard and mouse collections that
++ * sees each input before the system does, and RzCommon.sys, which gives applications a
++ * "Razer Control Device" per device to talk to it through. Synapse's mapping engine finds
++ * that device by its interface class and container ID, opens it, and asks for the inputs
++ * it remaps (hooks), for every input of a kind (redirection) or for copies of them
++ * (notification); the filter holds those back from the system and queues them as events.
++ * What the mapping engine makes of them it injects back through the same device.
++ *
++ * Wine cannot load either driver, and the input never passes through Wine anyway: the
++ * desktop reads it from the kernel's evdev nodes. So winebus provides the control device
++ * itself, with the same interface, and its Unix side does the filter's job on the evdev
++ * nodes: it grabs them while a client is listening, hands the client what it asked for,
++ * and passes everything else -- and everything injected -- on through uinput devices that
++ * copy the originals.
++ *
++ * The structures below are the ones RzCommon.sys exchanges with applications. */
++
++/* All METHOD_BUFFERED, FILE_ANY_ACCESS. */
++#define IOCTL_RAZER_SET_HOOKS_ENABLED   0x88883004  /* in: BYTE enable, default 1 */
++#define IOCTL_RAZER_READ_EVENT          0x88883018  /* out: struct razer_event, pends until there is one */
++#define IOCTL_RAZER_SET_REDIRECT        0x8888301c  /* in: struct razer_redirect */
++#define IOCTL_RAZER_SEND_INPUT          0x88883020  /* in: struct razer_send_input */
++#define IOCTL_RAZER_ADD_HOOK            0x88883024  /* in: struct razer_hook */
++#define IOCTL_RAZER_FIND_HOOK           0x88883028  /* in: struct razer_input, out: struct razer_hook */
++#define IOCTL_RAZER_REMOVE_HOOK         0x8888302c  /* in: struct razer_input */
++#define IOCTL_RAZER_GET_HOOK            0x88883030  /* in: UINT index, out: struct razer_hook */
++#define IOCTL_RAZER_RECEIVE_HOOKS       0x88883034  /* in: UINT enable, for this handle */
++#define IOCTL_RAZER_RECEIVE_NOTIFY      0x88883038  /* in: UINT enable, for this handle */
++#define IOCTL_RAZER_RECEIVE_OTHER       0x8888303c  /* in: UINT enable, for this handle */
++#define IOCTL_RAZER_GET_CONSUMER_STATE  0x88883108  /* out: BYTE[256], one per consumer key */
++#define IOCTL_RAZER_IS_OPEN             0x88883110  /* out: BYTE */
++
++/* Not RzCommon's: winebus' own, from the control device to the Unix side. */
++#define RAZER_SET_SUBSCRIPTIONS         0           /* in: UINT, the RAZER_EVENT_* any handle receives */
++#define RAZER_RESET                     1           /* the last handle is closed */
++
++/* the kind of an event, and what a handle receives */
++#define RAZER_EVENT_REDIRECT    0x01  /* every input of a redirected kind, held back */
++#define RAZER_EVENT_HOOK        0x02  /* an input a hook asked for, held back */
++#define RAZER_EVENT_NOTIFY      0x04  /* a copy of an input, which goes on to the system */
++#define RAZER_EVENT_OTHER       0x08
++
++/* what an input is */
++#define RAZER_INPUT_KEYBOARD    0x01  /* KEYBOARD_INPUT_DATA */
++#define RAZER_INPUT_MOUSE       0x02  /* MOUSE_INPUT_DATA */
++#define RAZER_INPUT_DKM         0x03  /* a Razer key, as KEYBOARD_INPUT_DATA */
++#define RAZER_INPUT_MOUSE_MOVE  0x04
++#define RAZER_INPUT_JOYSTICK_LEFT   0x05
++#define RAZER_INPUT_JOYSTICK_RIGHT  0x06
++#define RAZER_INPUT_JOYSTICK_BUTTON 0x07
++#define RAZER_INPUT_JOYSTICK_HAT    0x09
++#define RAZER_INPUT_DISPLAY     0x0a  /* consumer brightness up (0x6f) or down (0x70), 0 for none */
++#define RAZER_INPUT_CONSUMER    0x0b
++#define RAZER_INPUT_CONSUMER_REPORT 0x0c
++
++/* KEYBOARD_INPUT_DATA.Flags and MOUSE_INPUT_DATA, under names that do not clash with
++ * linux/input.h */
++#define RAZER_KEY_BREAK         0x0001
++#define RAZER_KEY_E0            0x0002
++#define RAZER_KEY_E1            0x0004
++#define RAZER_MOUSE_MOVE_ABSOLUTE   0x0001
++#define RAZER_MOUSE_VIRTUAL_DESKTOP 0x0002
++#define RAZER_MOUSE_LEFT_DOWN   0x0001
++#define RAZER_MOUSE_LEFT_UP     0x0002
++#define RAZER_MOUSE_RIGHT_DOWN  0x0004
++#define RAZER_MOUSE_RIGHT_UP    0x0008
++#define RAZER_MOUSE_MIDDLE_DOWN 0x0010
++#define RAZER_MOUSE_MIDDLE_UP   0x0020
++#define RAZER_MOUSE_BUTTON4_DOWN 0x0040
++#define RAZER_MOUSE_BUTTON4_UP  0x0080
++#define RAZER_MOUSE_BUTTON5_DOWN 0x0100
++#define RAZER_MOUSE_BUTTON5_UP  0x0200
++#define RAZER_MOUSE_WHEEL       0x0400
++#define RAZER_MOUSE_HWHEEL      0x0800
++
++/* the unit id of input the filter injected itself: hooks only see it if they ask for it */
++#define RAZER_UNIT_INJECTED     0xabcd
++
++/* modifier keys held, as the filter tracks them for hooks */
++#define RAZER_MOD_LSHIFT        0x0001
++#define RAZER_MOD_LCTRL         0x0002
++#define RAZER_MOD_LALT          0x0004
++#define RAZER_MOD_RSHIFT        0x0040
++#define RAZER_MOD_RCTRL         0x0080
++#define RAZER_MOD_RALT          0x0100
++
++#include "pshpack4.h"
++
++/* An input: KEYBOARD_INPUT_DATA or MOUSE_INPUT_DATA, whose ExtraInformation carries the
++ * modifier keys held. It starts a hook, and the payload of an event. */
++struct razer_input
++{
++    UINT reserved;
++    UINT type;                      /* RAZER_INPUT_* */
++    union
++    {
++        struct
++        {
++            USHORT unit_id;
++            USHORT make_code;
++            USHORT flags;
++            USHORT reserved;
++            UINT modifiers;
++        } keyboard;
++        struct
++        {
++            USHORT unit_id;
++            USHORT flags;
++            USHORT button_flags;
++            USHORT button_data;
++            UINT raw_buttons;
++            INT last_x;
++            INT last_y;
++            UINT modifiers;
++        } mouse;
++        BYTE raw[24];
++    };
++};
++
++#define RAZER_HOOK_SIZE  0x124
++#define RAZER_EVENT_SIZE 0x130
++
++/* What the application asks to have held back. The rest is the application's own. */
++struct razer_hook
++{
++    struct razer_input input;
++    BYTE data[RAZER_HOOK_SIZE - sizeof(struct razer_input)];
++};
++
++/* An event: for a hook, the hook with the input that matched it in its place. */
++struct razer_event
++{
++    UINT reserved[2];
++    UINT kind;                      /* RAZER_EVENT_* */
++    struct razer_hook hook;
++};
++
++struct razer_redirect
++{
++    UINT type;                      /* 1 keyboard, 2 mouse, 4 mouse movement */
++    UINT enable;
++};
++
++/* What the application injects, as if from the device. */
++struct razer_send_input
++{
++    UINT target;                    /* another control device's, or 0 */
++    UINT type;                      /* RAZER_INPUT_* */
++    union
++    {
++        struct
++        {
++            USHORT unit_id;
++            USHORT make_code;
++            USHORT flags;
++            USHORT reserved;
++            UINT extra;
++        } keyboard;
++        struct
++        {
++            USHORT unit_id;
++            USHORT flags;
++            USHORT button_flags;
++            USHORT button_data;
++            UINT raw_buttons;
++            INT last_x;
++            INT last_y;
++            UINT extra;
++        } mouse;
++        BYTE raw[24];
++    };
++};
++
++#include "poppack.h"
++
++C_ASSERT(sizeof(struct razer_input) == 0x20);
++C_ASSERT(sizeof(struct razer_hook) == RAZER_HOOK_SIZE);
++C_ASSERT(sizeof(struct razer_event) == RAZER_EVENT_SIZE);
++C_ASSERT(sizeof(struct razer_send_input) == 0x20);
++
++#ifndef WINE_UNIX_LIB
++
++/* razer.c: the control devices, for main.c */
++struct device_desc;
++struct _DRIVER_OBJECT;
++struct _DEVICE_OBJECT;
++struct _IRP;
++
++extern NTSTATUS razer_control_create(struct _DRIVER_OBJECT *driver, UINT64 filter, const struct device_desc *desc);
++extern void razer_control_unlink(UINT64 filter);
++extern void razer_control_event(UINT64 filter, const struct razer_event *event);
++extern ULONG razer_control_count(void);
++extern ULONG razer_control_get_relations(struct _DEVICE_OBJECT **devices, ULONG count);
++extern BOOL razer_is_control(struct _DEVICE_OBJECT *device);
++extern NTSTATUS razer_control_pnp(struct _DEVICE_OBJECT *device, struct _IRP *irp);
++extern NTSTATUS WINAPI razer_dispatch_create(struct _DEVICE_OBJECT *device, struct _IRP *irp);
++extern NTSTATUS WINAPI razer_dispatch_close(struct _DEVICE_OBJECT *device, struct _IRP *irp);
++extern NTSTATUS WINAPI razer_dispatch_ioctl(struct _DEVICE_OBJECT *device, struct _IRP *irp);
++
++#endif /* WINE_UNIX_LIB */
++
++#endif /* __WINEBUS_RAZER_H */
+diff --git dlls/winebus.sys/razer_unix.c dlls/winebus.sys/razer_unix.c
+new file mode 100644
+index 0000000..124a00b
+--- /dev/null
++++ dlls/winebus.sys/razer_unix.c
+@@ -0,0 +1,1254 @@
++/*
++ * Razer input filter emulation, Unix side
++ *
++ * Copyright 2026 adds39939
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdarg.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#ifdef HAVE_LIBUDEV_H
++# include <libudev.h>
++#endif
++#ifdef HAVE_LINUX_INPUT_H
++# include <linux/input.h>
++# include <linux/uinput.h>
++#endif
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "ddk/wdm.h"
++#include "ddk/hidtypes.h"
++#include "hidusage.h"
++
++#include "wine/debug.h"
++#include "wine/list.h"
++
++#include "unix_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(razer);
++
++#if defined(HAVE_UDEV) && defined(HAVE_LINUX_INPUT_H) && defined(UI_DEV_SETUP)
++
++/* See razer.h for what this is for. One filter stands for one USB device, and takes in all
++ * of its evdev nodes; it lives as long as one of the device's hidraw nodes does. Everything
++ * here runs with bus_udev.c's lock held: reading the evdev nodes on the udev thread, and
++ * the control device's requests on whichever thread makes them. */
++
++#define BITS_PER_LONG (sizeof(unsigned long) * 8)
++#define NLONGS(x) (((x) + BITS_PER_LONG - 1) / BITS_PER_LONG)
++
++static inline BOOL test_bit(const unsigned long *bits, unsigned int bit)
++{
++    return (bits[bit / BITS_PER_LONG] >> (bit % BITS_PER_LONG)) & 1;
++}
++
++static inline void set_bit(unsigned long *bits, unsigned int bit, BOOL set)
++{
++    if (set) bits[bit / BITS_PER_LONG] |= 1ul << (bit % BITS_PER_LONG);
++    else bits[bit / BITS_PER_LONG] &= ~(1ul << (bit % BITS_PER_LONG));
++}
++
++/* An evdev node of the device. It is opened for as long as some handle wants any of the
++ * device's input, and grabbed -- held away from the desktop, with a uinput device standing
++ * in for it -- for as long as some handle may want to hold input back. */
++struct razer_node
++{
++    struct list entry;
++    char syspath[256];
++    char name[UINPUT_MAX_NAME_SIZE];
++    struct input_id id;
++    int fd;                                     /* the evdev node, -1 for the spare device */
++    int clone;                                  /* its uinput copy, -1 while not grabbed */
++    BOOL grabbed;
++    unsigned long evbits[NLONGS(EV_CNT)];
++    unsigned long keybits[NLONGS(KEY_CNT)];
++    unsigned long relbits[NLONGS(REL_CNT)];
++    unsigned long mscbits[NLONGS(MSC_CNT)];
++    unsigned long ledbits[NLONGS(LED_CNT)];
++    unsigned long propbits[NLONGS(INPUT_PROP_CNT)];
++    unsigned long down[NLONGS(KEY_CNT)];        /* keys down on the device, as read so far */
++    unsigned long pressed[NLONGS(KEY_CNT)];     /* keys down on the clone */
++    BOOL is_keyboard;                           /* has the letter keys */
++    BOOL dropped;                               /* lost events: resync at the end of the frame */
++    UINT frame_count;
++    struct input_event frame[64];
++    UINT out_count;                             /* events for the clone, written a frame at a time */
++    struct input_event out[64];
++    INT wheel_rest, hwheel_rest;                /* injected high resolution scrolling, not a notch yet */
++};
++
++struct razer_held
++{
++    struct list entry;
++    struct razer_hook *hook;
++};
++
++struct razer_hook_entry
++{
++    struct list entry;
++    struct razer_hook hook;
++    BOOL held;                                  /* took a press whose release is still to come */
++    BOOL removed;                               /* removed while held, goes with the release */
++};
++
++struct razer_filter
++{
++    struct list entry;
++    LONG ref;
++    UINT64 id;
++    char syspath[256];                          /* the USB device's */
++    struct device_desc desc;
++
++    UINT subscriptions;                         /* RAZER_EVENT_* some handle receives */
++    BOOL hooks_enabled;
++    BOOL redirect_keyboard;
++    BOOL redirect_mouse;
++    BOOL redirect_move;
++    UINT modifiers;
++    BOOL pause_pending;                         /* injected E1 1D, waiting for its 45 */
++
++    struct list hooks;
++    struct list held;
++    struct list nodes;
++    struct razer_node *spare;                   /* a uinput device for input no clone has */
++};
++
++static struct udev *udev;
++static struct list filters = LIST_INIT(filters);
++static UINT64 last_filter_id;
++static struct list *event_queue;
++
++/* Set 1 scan codes, with 0x100 for an E0 prefix and 0x200 for E1, by evdev key code.
++ * The ones up to KEY_KPDOT are the same numbers. */
++static const struct { USHORT key; USHORT scan; } key_scans[] =
++{
++    {KEY_ZENKAKUHANKAKU, 0x29}, {KEY_102ND, 0x56}, {KEY_F11, 0x57}, {KEY_F12, 0x58},
++    {KEY_RO, 0x73}, {KEY_KATAKANAHIRAGANA, 0x70}, {KEY_HENKAN, 0x79}, {KEY_MUHENKAN, 0x7b},
++    {KEY_KPJPCOMMA, 0x5c}, {KEY_KPENTER, 0x11c}, {KEY_RIGHTCTRL, 0x11d}, {KEY_KPSLASH, 0x135},
++    {KEY_SYSRQ, 0x137}, {KEY_RIGHTALT, 0x138}, {KEY_HOME, 0x147}, {KEY_UP, 0x148},
++    {KEY_PAGEUP, 0x149}, {KEY_LEFT, 0x14b}, {KEY_RIGHT, 0x14d}, {KEY_END, 0x14f},
++    {KEY_DOWN, 0x150}, {KEY_PAGEDOWN, 0x151}, {KEY_INSERT, 0x152}, {KEY_DELETE, 0x153},
++    {KEY_MUTE, 0x120}, {KEY_VOLUMEDOWN, 0x12e}, {KEY_VOLUMEUP, 0x130}, {KEY_POWER, 0x15e},
++    {KEY_KPEQUAL, 0x59}, {KEY_PAUSE, 0x21d}, {KEY_KPCOMMA, 0x7e}, {KEY_HANGEUL, 0xf2},
++    {KEY_HANJA, 0xf1}, {KEY_YEN, 0x7d}, {KEY_LEFTMETA, 0x15b}, {KEY_RIGHTMETA, 0x15c},
++    {KEY_COMPOSE, 0x15d}, {KEY_STOP, 0x168}, {KEY_HELP, 0x63}, {KEY_CALC, 0x121},
++    {KEY_SLEEP, 0x15f}, {KEY_WAKEUP, 0x163}, {KEY_MAIL, 0x16c}, {KEY_BOOKMARKS, 0x166},
++    {KEY_COMPUTER, 0x16b}, {KEY_BACK, 0x16a}, {KEY_FORWARD, 0x169}, {KEY_NEXTSONG, 0x119},
++    {KEY_PLAYPAUSE, 0x122}, {KEY_PREVIOUSSONG, 0x110}, {KEY_STOPCD, 0x124}, {KEY_HOMEPAGE, 0x132},
++    {KEY_REFRESH, 0x167}, {KEY_F13, 0x64}, {KEY_F14, 0x65}, {KEY_F15, 0x66}, {KEY_F16, 0x67},
++    {KEY_F17, 0x68}, {KEY_F18, 0x69}, {KEY_F19, 0x6a}, {KEY_F20, 0x6b}, {KEY_F21, 0x6c},
++    {KEY_F22, 0x6d}, {KEY_F23, 0x6e}, {KEY_F24, 0x76}, {KEY_SEARCH, 0x165}, {KEY_MEDIA, 0x16d},
++    {KEY_MENU, 0x15d}, {KEY_PRINT, 0x137}, {KEY_FIND, 0x165},
++};
++
++static USHORT key_to_scan(USHORT key)
++{
++    UINT i;
++
++    if (key && key <= KEY_KPDOT) return key;
++    for (i = 0; i < ARRAY_SIZE(key_scans); i++) if (key_scans[i].key == key) return key_scans[i].scan;
++    return 0;
++}
++
++static USHORT scan_to_key(USHORT scan)
++{
++    UINT i;
++
++    if (scan && scan <= KEY_KPDOT) return scan;
++    for (i = 0; i < ARRAY_SIZE(key_scans); i++) if (key_scans[i].scan == scan) return key_scans[i].key;
++    return 0;
++}
++
++/* Mouse buttons, and the MOUSE_INPUT_DATA bits for their press; the release is the next
++ * bit up. Buttons past the fifth have no ButtonFlags: Razer's driver puts them in
++ * ButtonData, from bit 0. */
++static const struct { USHORT button; UINT down; } button_flags[] =
++{
++    {BTN_LEFT, RAZER_MOUSE_LEFT_DOWN}, {BTN_RIGHT, RAZER_MOUSE_RIGHT_DOWN},
++    {BTN_MIDDLE, RAZER_MOUSE_MIDDLE_DOWN}, {BTN_SIDE, RAZER_MOUSE_BUTTON4_DOWN},
++    {BTN_EXTRA, RAZER_MOUSE_BUTTON5_DOWN}, {BTN_FORWARD, 0x00010000}, {BTN_BACK, 0x00040000},
++    {BTN_TASK, 0x00100000},
++};
++
++static struct razer_filter *find_filter(UINT64 id)
++{
++    struct razer_filter *filter;
++
++    LIST_FOR_EACH_ENTRY(filter, &filters, struct razer_filter, entry)
++        if (filter->id == id) return filter;
++    return NULL;
++}
++
++static void clone_flush(struct razer_node *node)
++{
++    ssize_t size = node->out_count * sizeof(*node->out);
++
++    if (node->out_count && write(node->clone, node->out, size) != size)
++        WARN("failed to write to the clone of %s: %s\n", node->syspath, strerror(errno));
++    node->out_count = 0;
++}
++
++/* queue an event for the clone; the end of a frame sends it all at once */
++static void clone_write(struct razer_node *node, USHORT type, USHORT code, INT value)
++{
++    struct input_event *event;
++
++    if (node->clone < 0) return;
++    if (type == EV_KEY && code < KEY_CNT) set_bit(node->pressed, code, value != 0);
++    if (node->out_count == ARRAY_SIZE(node->out)) clone_flush(node);
++    event = &node->out[node->out_count++];
++    memset(event, 0, sizeof(*event));
++    event->type = type;
++    event->code = code;
++    event->value = value;
++    if (type == EV_SYN && code == SYN_REPORT) clone_flush(node);
++}
++
++static int create_uinput(const char *name, const struct input_id *id, const unsigned long *evbits,
++                         const unsigned long *keybits, const unsigned long *relbits,
++                         const unsigned long *mscbits, const unsigned long *ledbits,
++                         const unsigned long *propbits, int source)
++{
++    struct uinput_setup setup = {0};
++    unsigned int i;
++    int fd;
++
++    if ((fd = open("/dev/uinput", O_RDWR | O_NONBLOCK | O_CLOEXEC)) < 0)
++    {
++        ERR("cannot open /dev/uinput: %s; a udev rule must give it to the seat, see 60-razer-synapse.rules\n",
++            strerror(errno));
++        return -1;
++    }
++
++    for (i = 0; i < EV_CNT; i++)
++    {
++        /* force feedback and the like would have to be handed on to the device; LEDs are */
++        if (i == EV_FF || i == EV_SND || i == EV_SW || i == EV_PWR || i == EV_FF_STATUS) continue;
++        if (test_bit(evbits, i)) ioctl(fd, UI_SET_EVBIT, i);
++    }
++    for (i = 0; i < KEY_CNT; i++) if (test_bit(keybits, i)) ioctl(fd, UI_SET_KEYBIT, i);
++    for (i = 0; i < REL_CNT; i++) if (test_bit(relbits, i)) ioctl(fd, UI_SET_RELBIT, i);
++    if (mscbits) for (i = 0; i < MSC_CNT; i++) if (test_bit(mscbits, i)) ioctl(fd, UI_SET_MSCBIT, i);
++    if (ledbits) for (i = 0; i < LED_CNT; i++) if (test_bit(ledbits, i)) ioctl(fd, UI_SET_LEDBIT, i);
++    if (propbits) for (i = 0; i < INPUT_PROP_CNT; i++) if (test_bit(propbits, i)) ioctl(fd, UI_SET_PROPBIT, i);
++    if (source >= 0 && test_bit(evbits, EV_ABS))
++    {
++        unsigned long absbits[NLONGS(ABS_CNT)] = {0};
++
++        ioctl(source, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
++        for (i = 0; i < ABS_CNT; i++)
++        {
++            struct uinput_abs_setup abs = {.code = i};
++            if (!test_bit(absbits, i) || ioctl(source, EVIOCGABS(i), &abs.absinfo) < 0) continue;
++            ioctl(fd, UI_SET_ABSBIT, i);
++            ioctl(fd, UI_ABS_SETUP, &abs);
++        }
++    }
++
++    /* the same name and ids as the device, so that the desktop gives the clone the
++     * device's settings -- pointer acceleration, scrolling, keyboard layout */
++    setup.id = *id;
++    snprintf(setup.name, sizeof(setup.name), "%s", name);
++    if (ioctl(fd, UI_DEV_SETUP, &setup) < 0 || ioctl(fd, UI_DEV_CREATE) < 0)
++    {
++        ERR("cannot create uinput device %s: %s\n", debugstr_a(name), strerror(errno));
++        close(fd);
++        return -1;
++    }
++    return fd;
++}
++
++static void release_clone(struct razer_node *node)
++{
++    BOOL pressed = FALSE;
++    unsigned int i;
++
++    for (i = 0; i < KEY_CNT; i++)
++    {
++        if (!test_bit(node->pressed, i)) continue;
++        clone_write(node, EV_KEY, i, 0);
++        pressed = TRUE;
++    }
++    if (pressed) clone_write(node, EV_SYN, SYN_REPORT, 0);
++}
++
++/* Let a node go back to the desktop. */
++static void node_ungrab(struct razer_node *node)
++{
++    if (!node->grabbed) return;
++    release_clone(node);
++    ioctl(node->clone, UI_DEV_DESTROY);
++    udev_unwatch_fd(node->clone);
++    node->clone = -1;
++    ioctl(node->fd, EVIOCGRAB, 0);
++    node->grabbed = FALSE;
++    TRACE("let go of %s\n", node->syspath);
++}
++
++/* Take a node from the desktop. Not while one of its keys is held down: the desktop
++ * would never see it come up. Then this is tried again at the end of each frame. */
++static void node_grab(struct razer_node *node)
++{
++    unsigned long down[NLONGS(KEY_CNT)] = {0};
++    unsigned int i;
++
++    if (node->grabbed || node->fd < 0) return;
++
++    ioctl(node->fd, EVIOCGKEY(sizeof(down)), down);
++    for (i = 0; i < ARRAY_SIZE(down); i++) if (down[i] & node->keybits[i]) return;
++
++    if ((node->clone = create_uinput(node->name, &node->id, node->evbits, node->keybits, node->relbits,
++                                     node->mscbits, node->ledbits, node->propbits, node->fd)) < 0)
++        return;
++    if (ioctl(node->fd, EVIOCGRAB, 1) < 0 || !udev_watch_fd(node->clone))
++    {
++        ERR("cannot grab %s: %s\n", node->syspath, strerror(errno));
++        ioctl(node->fd, EVIOCGRAB, 0);
++        ioctl(node->clone, UI_DEV_DESTROY);
++        close(node->clone);
++        node->clone = -1;
++        return;
++    }
++
++    memset(node->down, 0, sizeof(node->down));
++    memset(node->pressed, 0, sizeof(node->pressed));
++    node->grabbed = TRUE;
++    TRACE("grabbed %s %s, keyboard %u\n", node->syspath, debugstr_a(node->name), node->is_keyboard);
++}
++
++static void node_close(struct razer_node *node)
++{
++    if (node->fd < 0)
++    {
++        /* the spare device, never polled */
++        release_clone(node);
++        ioctl(node->clone, UI_DEV_DESTROY);
++        close(node->clone);
++    }
++    else
++    {
++        node_ungrab(node);
++        udev_unwatch_fd(node->fd);
++    }
++    free(node);
++}
++
++static struct razer_node *node_open(const char *syspath, const char *devnode)
++{
++    struct razer_node *node;
++
++    if (!(node = calloc(1, sizeof(*node)))) return NULL;
++    snprintf(node->syspath, sizeof(node->syspath), "%s", syspath);
++    node->clone = -1;
++
++    /* write access is for handing the desktop's keyboard LEDs on, see razer_filter_read */
++    if ((node->fd = open(devnode, O_RDWR | O_NONBLOCK | O_CLOEXEC)) < 0 &&
++        (node->fd = open(devnode, O_RDONLY | O_NONBLOCK | O_CLOEXEC)) < 0)
++    {
++        ERR("cannot open %s: %s; a udev rule must give it to the seat, see 60-razer-synapse.rules\n",
++            debugstr_a(devnode), strerror(errno));
++        free(node);
++        return NULL;
++    }
++
++    ioctl(node->fd, EVIOCGID, &node->id);
++    ioctl(node->fd, EVIOCGNAME(sizeof(node->name) - 1), node->name);
++    ioctl(node->fd, EVIOCGBIT(0, sizeof(node->evbits)), node->evbits);
++    ioctl(node->fd, EVIOCGBIT(EV_KEY, sizeof(node->keybits)), node->keybits);
++    ioctl(node->fd, EVIOCGBIT(EV_REL, sizeof(node->relbits)), node->relbits);
++    ioctl(node->fd, EVIOCGBIT(EV_MSC, sizeof(node->mscbits)), node->mscbits);
++    ioctl(node->fd, EVIOCGBIT(EV_LED, sizeof(node->ledbits)), node->ledbits);
++    ioctl(node->fd, EVIOCGPROP(sizeof(node->propbits)), node->propbits);
++    ioctl(node->fd, EVIOCGKEY(sizeof(node->down)), node->down);
++    node->is_keyboard = test_bit(node->keybits, KEY_A) && test_bit(node->keybits, KEY_Z);
++
++    if (!udev_watch_fd(node->fd))
++    {
++        close(node->fd);
++        free(node);
++        return NULL;
++    }
++    TRACE("opened %s %s\n", debugstr_a(devnode), debugstr_a(node->name));
++    return node;
++}
++
++/* Open the device's evdev nodes not open yet. */
++static void filter_open_nodes(struct razer_filter *filter)
++{
++    struct udev_list_entry *item;
++    struct udev_enumerate *enumerate;
++    struct udev_device *usb;
++    struct razer_node *node;
++
++    if (!udev || !(usb = udev_device_new_from_syspath(udev, filter->syspath))) return;
++    if (!(enumerate = udev_enumerate_new(udev)))
++    {
++        udev_device_unref(usb);
++        return;
++    }
++
++    udev_enumerate_add_match_parent(enumerate, usb);
++    udev_enumerate_add_match_subsystem(enumerate, "input");
++    udev_enumerate_add_match_sysname(enumerate, "event*");
++    udev_enumerate_scan_devices(enumerate);
++
++    udev_list_entry_foreach(item, udev_enumerate_get_list_entry(enumerate))
++    {
++        const char *syspath = udev_list_entry_get_name(item), *devnode;
++        struct udev_device *dev;
++        BOOL known = FALSE;
++
++        LIST_FOR_EACH_ENTRY(node, &filter->nodes, struct razer_node, entry)
++            if (!strcmp(node->syspath, syspath)) known = TRUE;
++        if (known || !(dev = udev_device_new_from_syspath(udev, syspath))) continue;
++        if ((devnode = udev_device_get_devnode(dev)) && (node = node_open(syspath, devnode)))
++            list_add_tail(&filter->nodes, &node->entry);
++        udev_device_unref(dev);
++    }
++
++    udev_enumerate_unref(enumerate);
++    udev_device_unref(usb);
++}
++
++/* Forget the presses hooks are holding, once nothing will bring their releases. */
++static void filter_drop_held(struct razer_filter *filter)
++{
++    struct razer_held *held, *next;
++    struct razer_hook_entry *entry;
++
++    LIST_FOR_EACH_ENTRY_SAFE(held, next, &filter->held, struct razer_held, entry)
++    {
++        entry = CONTAINING_RECORD(held->hook, struct razer_hook_entry, hook);
++        entry->held = FALSE;
++        if (entry->removed)
++        {
++            list_remove(&entry->entry);
++            free(entry);
++        }
++        list_remove(&held->entry);
++        free(held);
++    }
++}
++
++static BOOL filter_wants_grab(struct razer_filter *filter)
++{
++    return !!(filter->subscriptions & (RAZER_EVENT_HOOK | RAZER_EVENT_REDIRECT));
++}
++
++static void filter_update(struct razer_filter *filter)
++{
++    struct razer_node *node, *next;
++
++    if (filter->subscriptions) filter_open_nodes(filter);
++    LIST_FOR_EACH_ENTRY_SAFE(node, next, &filter->nodes, struct razer_node, entry)
++    {
++        if (!filter->subscriptions)
++        {
++            list_remove(&node->entry);
++            node_close(node);
++        }
++        else if (filter_wants_grab(filter)) node_grab(node);
++        else node_ungrab(node);
++    }
++    if (!filter_wants_grab(filter))
++    {
++        if (filter->spare) node_close(filter->spare);
++        filter->spare = NULL;
++        filter_drop_held(filter);
++        filter->modifiers = 0;
++    }
++}
++
++static void filter_clear_hooks(struct razer_filter *filter)
++{
++    struct razer_hook_entry *entry, *next;
++
++    filter->subscriptions = 0;
++    filter_update(filter);
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, &filter->hooks, struct razer_hook_entry, entry)
++    {
++        list_remove(&entry->entry);
++        free(entry);
++    }
++    filter->hooks_enabled = TRUE;
++    filter->redirect_keyboard = filter->redirect_mouse = filter->redirect_move = FALSE;
++}
++
++struct razer_filter *razer_filter_add(struct udev *context, struct udev_device *dev,
++                                      const struct device_desc *desc, struct list *queue)
++{
++    struct udev_device *usb = udev_device_get_parent_with_subsystem_devtype(dev, "usb", "usb_device");
++    const char *syspath = usb ? udev_device_get_syspath(usb) : NULL;
++    struct razer_filter *filter;
++
++    if (!syspath || strlen(syspath) >= sizeof(filter->syspath)) return NULL;
++    udev = context;
++    event_queue = queue;
++
++    LIST_FOR_EACH_ENTRY(filter, &filters, struct razer_filter, entry)
++    {
++        if (strcmp(filter->syspath, syspath)) continue;
++        filter->ref++;
++        /* an interface that came late may have brought evdev nodes with it */
++        if (filter->subscriptions) filter_update(filter);
++        return filter;
++    }
++
++    if (!(filter = calloc(1, sizeof(*filter)))) return NULL;
++    filter->ref = 1;
++    filter->id = ++last_filter_id;
++    strcpy(filter->syspath, syspath);
++    filter->desc = *desc;
++    filter->desc.input = -1;
++    filter->hooks_enabled = TRUE;
++    list_init(&filter->hooks);
++    list_init(&filter->held);
++    list_init(&filter->nodes);
++    list_add_tail(&filters, &filter->entry);
++
++    TRACE("filter %s for %04x:%04x at %s\n", wine_dbgstr_longlong(filter->id), desc->vid, desc->pid, syspath);
++    bus_event_queue_razer_created(queue, filter->id, &filter->desc);
++    return filter;
++}
++
++void razer_filter_release(struct razer_filter *filter, struct list *queue)
++{
++    if (--filter->ref) return;
++
++    TRACE("filter %s gone\n", wine_dbgstr_longlong(filter->id));
++    filter_clear_hooks(filter);
++    list_remove(&filter->entry);
++    bus_event_queue_razer_removed(queue, filter->id);
++    free(filter);
++}
++
++/* bus_udev.c's loop is ending, and its udev context with it */
++void razer_filter_shutdown(void)
++{
++    struct razer_filter *filter;
++
++    LIST_FOR_EACH_ENTRY(filter, &filters, struct razer_filter, entry)
++    {
++        filter->subscriptions = 0;
++        filter_update(filter);
++    }
++    udev = NULL;
++}
++
++/* What RzCommon.sys does to find the hook for an input. A release, or a repeated press,
++ * goes to the hook that took the press, whatever modifier keys are held by then. A press
++ * goes to a hook for exactly the modifier keys held, failing that to one for a subset of
++ * them, failing that to one for none. Input injected by the filter itself only goes to
++ * hooks that ask for injected input. */
++static BOOL hook_same_input(const struct razer_input *hook, const struct razer_input *input)
++{
++    UINT hook_buttons, input_buttons;
++    BOOL match;
++
++    if (hook->type != input->type) return FALSE;
++    if ((hook->keyboard.unit_id == RAZER_UNIT_INJECTED) != (input->keyboard.unit_id == RAZER_UNIT_INJECTED)) return FALSE;
++
++    switch (input->type)
++    {
++    case RAZER_INPUT_KEYBOARD:
++    case RAZER_INPUT_DKM:
++        return hook->keyboard.make_code == input->keyboard.make_code &&
++               !((hook->keyboard.flags ^ input->keyboard.flags) & ~RAZER_KEY_BREAK);
++    case RAZER_INPUT_CONSUMER:
++        return (BYTE)hook->keyboard.make_code == (BYTE)input->keyboard.make_code;
++    case RAZER_INPUT_MOUSE:
++        hook_buttons = hook->mouse.button_flags | (UINT)hook->mouse.button_data << 16;
++        input_buttons = input->mouse.button_flags | (UINT)input->mouse.button_data << 16;
++        match = (hook->mouse.button_flags & input->mouse.button_flags) != 0;
++        if (input->mouse.button_flags & RAZER_MOUSE_WHEEL) match = match && hook_buttons == input_buttons;
++        if ((input->mouse.button_flags & RAZER_MOUSE_HWHEEL) && hook_buttons != input_buttons) match = FALSE;
++        if (!input->mouse.button_flags && (hook_buttons & input_buttons)) match = TRUE;
++        return match;
++    }
++    return FALSE;
++}
++
++static UINT input_modifiers(const struct razer_input *input)
++{
++    return input->type == RAZER_INPUT_MOUSE ? input->mouse.modifiers : input->keyboard.modifiers;
++}
++
++static BOOL input_is_wheel(const struct razer_input *input)
++{
++    return input->type == RAZER_INPUT_MOUSE && (input->mouse.button_flags & (RAZER_MOUSE_WHEEL | RAZER_MOUSE_HWHEEL));
++}
++
++/* the hook holding the press of an input, if any; a release lets go of it */
++static struct razer_hook_entry *find_held(struct razer_filter *filter, const struct razer_input *input, BOOL press)
++{
++    struct razer_hook_entry *entry;
++    struct razer_held *held;
++
++    LIST_FOR_EACH_ENTRY_REV(held, &filter->held, struct razer_held, entry)
++    {
++        entry = CONTAINING_RECORD(held->hook, struct razer_hook_entry, hook);
++        if (!hook_same_input(&entry->hook.input, input)) continue;
++        if (!press)
++        {
++            list_remove(&held->entry);
++            free(held);
++            entry->held = FALSE;
++        }
++        return entry;
++    }
++    return NULL;
++}
++
++static struct razer_hook_entry *find_hook(struct razer_filter *filter, const struct razer_input *input)
++{
++    struct razer_hook_entry *entry, *exact = NULL, *subset = NULL, *any = NULL;
++    struct razer_held *held;
++    UINT mods = input_modifiers(input), hook_mods;
++
++    LIST_FOR_EACH_ENTRY_REV(entry, &filter->hooks, struct razer_hook_entry, entry)
++    {
++        if (entry->held || entry->removed || !hook_same_input(&entry->hook.input, input)) continue;
++        hook_mods = input_modifiers(&entry->hook.input);
++        if (hook_mods == mods)
++        {
++            exact = entry;
++            break;
++        }
++        if (!hook_mods) any = entry;
++        else if ((mods & hook_mods) == hook_mods &&
++                 (!((mods ^ hook_mods) & 0x3000000) || input->type == RAZER_INPUT_DKM)) subset = entry;
++    }
++    if (!(entry = exact ? exact : subset ? subset : any)) return NULL;
++
++    if (!input_is_wheel(input) && (held = malloc(sizeof(*held))))
++    {
++        held->hook = &entry->hook;
++        list_add_tail(&filter->held, &held->entry);
++        entry->held = TRUE;
++    }
++    return entry;
++}
++
++static BOOL hook_equal(const struct razer_input *hook, const struct razer_input *input)
++{
++    if (hook->type != input->type) return FALSE;
++    if ((hook->keyboard.unit_id == RAZER_UNIT_INJECTED) != (input->keyboard.unit_id == RAZER_UNIT_INJECTED)) return FALSE;
++
++    switch (input->type)
++    {
++    case RAZER_INPUT_KEYBOARD:
++    case RAZER_INPUT_DKM:
++        return hook->keyboard.make_code == input->keyboard.make_code &&
++               !((hook->keyboard.flags ^ input->keyboard.flags) & ~RAZER_KEY_BREAK) &&
++               hook->keyboard.modifiers == input->keyboard.modifiers;
++    case RAZER_INPUT_CONSUMER:
++        return (BYTE)hook->keyboard.make_code == (BYTE)input->keyboard.make_code &&
++               hook->keyboard.modifiers == input->keyboard.modifiers;
++    case RAZER_INPUT_MOUSE:
++        return hook->mouse.button_flags == input->mouse.button_flags &&
++               hook->mouse.button_data == input->mouse.button_data &&
++               hook->mouse.modifiers == input->mouse.modifiers;
++    }
++    return FALSE;
++}
++
++static void remove_hook(struct razer_filter *filter, const struct razer_input *input)
++{
++    struct razer_hook_entry *entry, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, &filter->hooks, struct razer_hook_entry, entry)
++    {
++        if (entry->removed || !hook_equal(&entry->hook.input, input)) continue;
++        if (entry->held) entry->removed = TRUE;
++        else
++        {
++            list_remove(&entry->entry);
++            free(entry);
++        }
++    }
++}
++
++static void queue_event(struct razer_filter *filter, UINT kind, const struct razer_input *input,
++                        const struct razer_hook *hook)
++{
++    struct razer_event event = {.kind = kind};
++
++    if (hook) event.hook = *hook;
++    event.hook.input = *input;
++    TRACE("filter %s kind %#x type %#x %s\n", wine_dbgstr_longlong(filter->id), kind, input->type,
++          input->type == RAZER_INPUT_MOUSE
++          ? wine_dbg_sprintf("buttons %#x data %#x move %d,%d", input->mouse.button_flags,
++                             input->mouse.button_data, input->mouse.last_x, input->mouse.last_y)
++          : wine_dbg_sprintf("make %#x flags %#x", input->keyboard.make_code, input->keyboard.flags));
++    bus_event_queue_razer_event(event_queue, filter->id, &event);
++}
++
++/* The modifier keys held, as RzCommon.sys tracks them from what it lets through and what
++ * is injected. */
++static void track_modifiers(struct razer_filter *filter, const struct razer_input *input)
++{
++    BOOL press = !(input->keyboard.flags & RAZER_KEY_BREAK), e0 = !!(input->keyboard.flags & RAZER_KEY_E0);
++    UINT bit = 0;
++
++    if (input->type != RAZER_INPUT_KEYBOARD || (input->keyboard.flags & RAZER_KEY_E1)) return;
++    switch (input->keyboard.make_code)
++    {
++    case 0x1d: bit = e0 ? RAZER_MOD_RCTRL : RAZER_MOD_LCTRL; break;
++    case 0x2a: bit = RAZER_MOD_LSHIFT; break;
++    case 0x36: bit = RAZER_MOD_RSHIFT; break;
++    case 0x38: bit = e0 ? RAZER_MOD_RALT : RAZER_MOD_LALT; break;
++    }
++    if (press) filter->modifiers |= bit;
++    else filter->modifiers &= ~bit;
++}
++
++/* An input from the device: TRUE if the filter takes it, FALSE if it goes on. From a node
++ * not grabbed, nothing can be taken, only reported. */
++static BOOL filter_input(struct razer_filter *filter, struct razer_node *node, struct razer_input *input, BOOL press)
++{
++    struct razer_hook_entry *entry;
++    BOOL keyboard = input->type == RAZER_INPUT_KEYBOARD;
++
++    if (keyboard) input->keyboard.modifiers = filter->modifiers;
++    else input->mouse.modifiers = filter->modifiers;
++
++    if (node->grabbed && (filter->subscriptions & RAZER_EVENT_REDIRECT) &&
++        (keyboard ? filter->redirect_keyboard : filter->redirect_mouse))
++    {
++        queue_event(filter, RAZER_EVENT_REDIRECT, input, NULL);
++        return TRUE;
++    }
++
++    if ((filter->subscriptions & RAZER_EVENT_NOTIFY) && (keyboard || input->mouse.button_flags || input->mouse.button_data))
++        queue_event(filter, RAZER_EVENT_NOTIFY, input, NULL);
++
++    /* the release of a press a hook took goes the same way, whatever has changed since */
++    if (!press && !input_is_wheel(input) && (entry = find_held(filter, input, FALSE)))
++    {
++        if (filter->subscriptions & RAZER_EVENT_HOOK) queue_event(filter, RAZER_EVENT_HOOK, input, &entry->hook);
++        if (entry->removed && !entry->held)
++        {
++            list_remove(&entry->entry);
++            free(entry);
++        }
++        return TRUE;
++    }
++
++    if (node->grabbed && (press || input_is_wheel(input)) && (filter->subscriptions & RAZER_EVENT_HOOK) &&
++        filter->hooks_enabled && ((entry = find_held(filter, input, TRUE)) || (entry = find_hook(filter, input))))
++    {
++        queue_event(filter, RAZER_EVENT_HOOK, input, &entry->hook);
++        return TRUE;
++    }
++
++    track_modifiers(filter, input);
++    return FALSE;
++}
++
++/* One frame from an evdev node, up to SYN_REPORT. Keys and buttons are filtered one by
++ * one, and each wheel as it moved in the frame -- one report from the device, as Windows
++ * gets it too. Pointer movement always goes on. */
++static void process_frame(struct razer_filter *filter, struct razer_node *node)
++{
++    INT wheel = 0, wheel_hr = 0, hwheel = 0, hwheel_hr = 0;
++    BOOL has_wheel = FALSE, has_wheel_hr = FALSE, has_hwheel = FALSE, has_hwheel_hr = FALSE;
++    struct razer_input input;
++    BOOL written = FALSE;
++    UINT i, j;
++
++    for (i = 0; i < node->frame_count; i++)
++    {
++        struct input_event *event = &node->frame[i];
++        USHORT scan;
++
++        switch (event->type)
++        {
++        case EV_MSC:
++            break;
++        case EV_KEY:
++            /* the desktop repeats keys itself */
++            if (event->value == 2) break;
++            if (event->code < KEY_CNT) set_bit(node->down, event->code, event->value != 0);
++            memset(&input, 0, sizeof(input));
++            for (j = 0; j < ARRAY_SIZE(button_flags); j++) if (button_flags[j].button == event->code) break;
++            if (j < ARRAY_SIZE(button_flags))
++            {
++                UINT flags = event->value ? button_flags[j].down : button_flags[j].down << 1;
++                input.type = RAZER_INPUT_MOUSE;
++                input.mouse.button_flags = flags;
++                input.mouse.button_data = flags >> 16;
++            }
++            else if ((scan = key_to_scan(event->code)))
++            {
++                input.type = RAZER_INPUT_KEYBOARD;
++                input.keyboard.make_code = scan & 0xff;
++                if (scan & 0x100) input.keyboard.flags |= RAZER_KEY_E0;
++                if (scan & 0x200) input.keyboard.flags |= RAZER_KEY_E1;
++                if (!event->value) input.keyboard.flags |= RAZER_KEY_BREAK;
++            }
++            /* what the clone was told is down comes up there, whoever wants it now */
++            if (!event->value && event->code < KEY_CNT && test_bit(node->pressed, event->code))
++                track_modifiers(filter, &input);
++            else if (input.type && filter_input(filter, node, &input, event->value)) break;
++            clone_write(node, event->type, event->code, event->value);
++            written = TRUE;
++            break;
++        case EV_REL:
++            switch (event->code)
++            {
++            case REL_WHEEL: wheel += event->value; has_wheel = TRUE; break;
++            case REL_WHEEL_HI_RES: wheel_hr += event->value; has_wheel_hr = TRUE; break;
++            case REL_HWHEEL: hwheel += event->value; has_hwheel = TRUE; break;
++            case REL_HWHEEL_HI_RES: hwheel_hr += event->value; has_hwheel_hr = TRUE; break;
++            default:
++                clone_write(node, event->type, event->code, event->value);
++                written = TRUE;
++                break;
++            }
++            break;
++        default:
++            clone_write(node, event->type, event->code, event->value);
++            written = TRUE;
++            break;
++        }
++    }
++
++    if (has_wheel || has_wheel_hr)
++    {
++        memset(&input, 0, sizeof(input));
++        input.type = RAZER_INPUT_MOUSE;
++        input.mouse.button_flags = RAZER_MOUSE_WHEEL;
++        input.mouse.button_data = has_wheel_hr ? wheel_hr : wheel * 120;
++        if (!filter_input(filter, node, &input, TRUE))
++        {
++            if (has_wheel) clone_write(node, EV_REL, REL_WHEEL, wheel);
++            if (has_wheel_hr) clone_write(node, EV_REL, REL_WHEEL_HI_RES, wheel_hr);
++            written = TRUE;
++        }
++    }
++    if (has_hwheel || has_hwheel_hr)
++    {
++        memset(&input, 0, sizeof(input));
++        input.type = RAZER_INPUT_MOUSE;
++        input.mouse.button_flags = RAZER_MOUSE_HWHEEL;
++        input.mouse.button_data = has_hwheel_hr ? hwheel_hr : hwheel * 120;
++        if (!filter_input(filter, node, &input, TRUE))
++        {
++            if (has_hwheel) clone_write(node, EV_REL, REL_HWHEEL, hwheel);
++            if (has_hwheel_hr) clone_write(node, EV_REL, REL_HWHEEL_HI_RES, hwheel_hr);
++            written = TRUE;
++        }
++    }
++
++    if (written) clone_write(node, EV_SYN, SYN_REPORT, 0);
++}
++
++/* Events were lost, or a frame did not fit: bring the keys known to be down back in line
++ * with the device, so that nothing stays held on the clone or in a hook. */
++static void resync_node(struct razer_filter *filter, struct razer_node *node)
++{
++    unsigned long now[NLONGS(KEY_CNT)] = {0};
++    unsigned int i;
++
++    TRACE("%s lost events, resyncing\n", node->syspath);
++    ioctl(node->fd, EVIOCGKEY(sizeof(now)), now);
++    node->frame_count = 0;
++    for (i = 0; i < KEY_CNT && node->frame_count < ARRAY_SIZE(node->frame); i++)
++    {
++        struct input_event *event;
++
++        if (test_bit(node->down, i) == test_bit(now, i)) continue;
++        event = &node->frame[node->frame_count++];
++        memset(event, 0, sizeof(*event));
++        event->type = EV_KEY;
++        event->code = i;
++        event->value = test_bit(now, i);
++    }
++    process_frame(filter, node);
++}
++
++/* LEDs the desktop sets on a clone: the device itself only takes them from whoever holds
++ * the grab */
++static void read_clone(struct razer_node *node)
++{
++    struct input_event events[16];
++    int size, i, count = 0;
++
++    /* leave room for a SYN_REPORT after them */
++    while ((size = read(node->clone, events, sizeof(events) - sizeof(*events))) > 0)
++    {
++        for (i = 0; i < size / (int)sizeof(*events); i++)
++            if (events[i].type == EV_LED) events[count++] = events[i];
++        if (!count) continue;
++        events[count].type = EV_SYN;
++        events[count].code = SYN_REPORT;
++        events[count].value = 0;
++        if (write(node->fd, events, (count + 1) * sizeof(*events)) < 0)
++            WARN("failed to set LEDs on %s: %s\n", node->syspath, strerror(errno));
++        count = 0;
++    }
++}
++
++BOOL razer_filter_read(int fd, struct list *queue)
++{
++    struct razer_filter *filter;
++    struct razer_node *node;
++    struct input_event events[64];
++    int size, i;
++
++    LIST_FOR_EACH_ENTRY(filter, &filters, struct razer_filter, entry)
++    {
++        LIST_FOR_EACH_ENTRY(node, &filter->nodes, struct razer_node, entry)
++        {
++            if (node->clone == fd)
++            {
++                read_clone(node);
++                return TRUE;
++            }
++            if (node->fd != fd) continue;
++            event_queue = queue;
++
++            while ((size = read(fd, events, sizeof(events))) > 0)
++            {
++                for (i = 0; i < size / (int)sizeof(*events); i++)
++                {
++                    if (events[i].type == EV_SYN && events[i].code == SYN_DROPPED)
++                    {
++                        node->dropped = TRUE;
++                        node->frame_count = 0;
++                    }
++                    else if (events[i].type == EV_SYN && events[i].code == SYN_REPORT)
++                    {
++                        if (node->dropped) resync_node(filter, node);
++                        else process_frame(filter, node);
++                        node->dropped = FALSE;
++                        node->frame_count = 0;
++                        if (!node->grabbed && filter_wants_grab(filter)) node_grab(node);
++                    }
++                    else if (node->dropped) continue;
++                    else if (node->frame_count < ARRAY_SIZE(node->frame))
++                        node->frame[node->frame_count++] = events[i];
++                    else
++                    {
++                        node->dropped = TRUE;
++                        node->frame_count = 0;
++                    }
++                }
++            }
++            if (size < 0 && errno == ENODEV)
++            {
++                TRACE("%s is gone\n", node->syspath);
++                list_remove(&node->entry);
++                node_close(node);
++            }
++            return TRUE;
++        }
++    }
++    return FALSE;
++}
++
++/* Where to put injected input: a clone that has the key, preferring a keyboard's for keys,
++ * or a uinput device of the filter's own that has everything. */
++static struct razer_node *output_node(struct razer_filter *filter, USHORT code, BOOL rel)
++{
++    static const struct input_id spare_id = {.bustype = BUS_VIRTUAL, .vendor = 0x1532, .product = 0xffff};
++    unsigned long evbits[NLONGS(EV_CNT)] = {0};
++    struct razer_node *node, *found = NULL;
++    unsigned int i;
++
++    LIST_FOR_EACH_ENTRY(node, &filter->nodes, struct razer_node, entry)
++    {
++        if (!node->grabbed || !test_bit(rel ? node->relbits : node->keybits, code)) continue;
++        if (rel || code >= BTN_MISC || node->is_keyboard) return node;
++        if (!found) found = node;
++    }
++    if (found) return found;
++
++    if (filter->spare) return filter->spare;
++    if (!(node = calloc(1, sizeof(*node)))) return NULL;
++    node->fd = -1;
++    set_bit(evbits, EV_KEY, TRUE);
++    set_bit(evbits, EV_REL, TRUE);
++    for (i = KEY_ESC; i < BTN_MISC; i++) set_bit(node->keybits, i, TRUE);
++    for (i = KEY_OK; i < KEY_MAX; i++) set_bit(node->keybits, i, TRUE);
++    for (i = BTN_LEFT; i <= BTN_TASK; i++) set_bit(node->keybits, i, TRUE);
++    set_bit(node->relbits, REL_X, TRUE);
++    set_bit(node->relbits, REL_Y, TRUE);
++    set_bit(node->relbits, REL_WHEEL, TRUE);
++    set_bit(node->relbits, REL_HWHEEL, TRUE);
++    set_bit(node->relbits, REL_WHEEL_HI_RES, TRUE);
++    set_bit(node->relbits, REL_HWHEEL_HI_RES, TRUE);
++    strcpy(node->syspath, "spare");
++    if ((node->clone = create_uinput("Razer Synapse virtual input", &spare_id, evbits, node->keybits,
++                                     node->relbits, NULL, NULL, NULL, -1)) < 0)
++    {
++        free(node);
++        return NULL;
++    }
++    return filter->spare = node;
++}
++
++static void send_key(struct razer_filter *filter, USHORT code, BOOL press)
++{
++    struct razer_node *node;
++
++    if (!code || !(node = output_node(filter, code, FALSE))) return;
++    clone_write(node, EV_KEY, code, press);
++    clone_write(node, EV_SYN, SYN_REPORT, 0);
++}
++
++static void send_scroll(struct razer_node *node, USHORT code, USHORT code_hr, SHORT data, INT *rest)
++{
++    *rest += data;
++    if (test_bit(node->relbits, code_hr)) clone_write(node, EV_REL, code_hr, data);
++    if (*rest / 120)
++    {
++        clone_write(node, EV_REL, code, *rest / 120);
++        *rest %= 120;
++    }
++}
++
++static void send_input(struct razer_filter *filter, const struct razer_send_input *send)
++{
++    struct razer_input input = {0};
++    struct razer_node *node;
++    USHORT scan, data;
++    UINT i, flags;
++
++    switch (send->type)
++    {
++    case RAZER_INPUT_KEYBOARD:
++        input.type = RAZER_INPUT_KEYBOARD;
++        input.keyboard.make_code = send->keyboard.make_code;
++        input.keyboard.flags = send->keyboard.flags;
++        track_modifiers(filter, &input);
++
++        /* Pause comes as E1 1D, then 45 */
++        if (send->keyboard.flags & RAZER_KEY_E1)
++        {
++            filter->pause_pending = send->keyboard.make_code == 0x1d;
++            send_key(filter, KEY_PAUSE, !(send->keyboard.flags & RAZER_KEY_BREAK));
++            break;
++        }
++        if (filter->pause_pending && send->keyboard.make_code == 0x45)
++        {
++            filter->pause_pending = FALSE;
++            break;
++        }
++        scan = send->keyboard.make_code | (send->keyboard.flags & RAZER_KEY_E0 ? 0x100 : 0);
++        TRACE("filter %s key %#x %s\n", wine_dbgstr_longlong(filter->id), scan,
++              send->keyboard.flags & RAZER_KEY_BREAK ? "up" : "down");
++        if (!scan_to_key(scan)) FIXME("no key for scan code %#x\n", scan);
++        send_key(filter, scan_to_key(scan), !(send->keyboard.flags & RAZER_KEY_BREAK));
++        break;
++
++    case RAZER_INPUT_MOUSE:
++        TRACE("filter %s mouse flags %#x buttons %#x data %#x move %d,%d\n", wine_dbgstr_longlong(filter->id),
++              send->mouse.flags, send->mouse.button_flags, send->mouse.button_data,
++              send->mouse.last_x, send->mouse.last_y);
++        if (!(node = output_node(filter, REL_X, TRUE))) break;
++
++        flags = send->mouse.button_flags;
++        if (!(flags & (RAZER_MOUSE_WHEEL | RAZER_MOUSE_HWHEEL))) flags |= (UINT)send->mouse.button_data << 16;
++        for (i = 0; i < ARRAY_SIZE(button_flags); i++)
++        {
++            if (flags & button_flags[i].down) clone_write(node, EV_KEY, button_flags[i].button, 1);
++            if (flags & (button_flags[i].down << 1)) clone_write(node, EV_KEY, button_flags[i].button, 0);
++        }
++        data = send->mouse.button_data;
++        if (flags & RAZER_MOUSE_WHEEL) send_scroll(node, REL_WHEEL, REL_WHEEL_HI_RES, data, &node->wheel_rest);
++        if (flags & RAZER_MOUSE_HWHEEL) send_scroll(node, REL_HWHEEL, REL_HWHEEL_HI_RES, data, &node->hwheel_rest);
++
++        if (send->mouse.flags & RAZER_MOUSE_MOVE_ABSOLUTE)
++        {
++            if (send->mouse.last_x || send->mouse.last_y)
++                FIXME("absolute movement to %d,%d not implemented\n", send->mouse.last_x, send->mouse.last_y);
++        }
++        else
++        {
++            if (send->mouse.last_x) clone_write(node, EV_REL, REL_X, send->mouse.last_x);
++            if (send->mouse.last_y) clone_write(node, EV_REL, REL_Y, send->mouse.last_y);
++        }
++        clone_write(node, EV_SYN, SYN_REPORT, 0);
++        break;
++
++    case RAZER_INPUT_DKM:
++        break;
++
++    case RAZER_INPUT_DISPLAY:
++        TRACE("filter %s display %#x\n", wine_dbgstr_longlong(filter->id), send->raw[0]);
++        if (send->raw[0] == 0x6f) send_key(filter, KEY_BRIGHTNESSUP, TRUE);
++        else if (send->raw[0] == 0x70) send_key(filter, KEY_BRIGHTNESSDOWN, TRUE);
++        else
++        {
++            send_key(filter, KEY_BRIGHTNESSUP, FALSE);
++            send_key(filter, KEY_BRIGHTNESSDOWN, FALSE);
++        }
++        break;
++
++    default:
++        FIXME("filter %s input type %#x not implemented: %s\n", wine_dbgstr_longlong(filter->id), send->type,
++              wine_dbgstr_an((const char *)send->raw, sizeof(send->raw)));
++        break;
++    }
++}
++
++NTSTATUS razer_filter_ioctl(struct razer_ioctl_params *params)
++{
++    struct razer_filter *filter = find_filter(params->filter);
++    const struct razer_input *input = params->in;
++    struct razer_hook_entry *entry;
++    UINT index = 0;
++
++    params->out_len = 0;
++    if (!filter) return STATUS_DEVICE_NOT_CONNECTED;
++
++    switch (params->code)
++    {
++    case RAZER_SET_SUBSCRIPTIONS:
++        if (params->in_size < sizeof(UINT)) return STATUS_INVALID_PARAMETER;
++        TRACE("filter %s subscriptions %#x\n", wine_dbgstr_longlong(filter->id), *(UINT *)params->in);
++        filter->subscriptions = *(UINT *)params->in;
++        filter_update(filter);
++        return STATUS_SUCCESS;
++
++    case RAZER_RESET:
++        /* the last handle is closed; the next client starts from a clean slate, as it
++         * would after a restart */
++        TRACE("filter %s reset\n", wine_dbgstr_longlong(filter->id));
++        filter->subscriptions = 0;
++        filter_clear_hooks(filter);
++        return STATUS_SUCCESS;
++
++    case IOCTL_RAZER_SET_HOOKS_ENABLED:
++        if (params->in_size < 1) return STATUS_INVALID_PARAMETER;
++        filter->hooks_enabled = !!*(BYTE *)params->in;
++        return STATUS_SUCCESS;
++
++    case IOCTL_RAZER_SET_REDIRECT:
++    {
++        const struct razer_redirect *redirect = params->in;
++        if (params->in_size < sizeof(*redirect)) return STATUS_INVALID_PARAMETER;
++        TRACE("filter %s redirect %u %u\n", wine_dbgstr_longlong(filter->id), redirect->type, redirect->enable);
++        if (redirect->type == 1) filter->redirect_keyboard = !!redirect->enable;
++        else if (redirect->type == 2) filter->redirect_mouse = !!redirect->enable;
++        else if (redirect->type == 4)
++        {
++            /* the mapping engine wants pointer movement from Razer's driver below the HID
++             * stack; it goes on to the desktop here regardless */
++            filter->redirect_move = !!redirect->enable;
++            if (redirect->enable) FIXME("redirection of pointer movement not implemented\n");
++        }
++        return STATUS_SUCCESS;
++    }
++
++    case IOCTL_RAZER_SEND_INPUT:
++        if (params->in_size < sizeof(struct razer_send_input)) return STATUS_INVALID_PARAMETER;
++        send_input(filter, params->in);
++        return STATUS_SUCCESS;
++
++    case IOCTL_RAZER_ADD_HOOK:
++        if (params->in_size < sizeof(struct razer_hook)) return STATUS_INVALID_PARAMETER;
++        TRACE("filter %s add hook type %#x unit %#x %s modifiers %#x\n", wine_dbgstr_longlong(filter->id),
++              input->type, input->keyboard.unit_id,
++              input->type == RAZER_INPUT_MOUSE
++              ? wine_dbg_sprintf("buttons %#x data %#x", input->mouse.button_flags, input->mouse.button_data)
++              : wine_dbg_sprintf("make %#x flags %#x", input->keyboard.make_code, input->keyboard.flags),
++              input_modifiers(input));
++        remove_hook(filter, input);
++        if (!(entry = calloc(1, sizeof(*entry)))) return STATUS_NO_MEMORY;
++        memcpy(&entry->hook, params->in, sizeof(entry->hook));
++        list_add_tail(&filter->hooks, &entry->entry);
++        return STATUS_SUCCESS;
++
++    case IOCTL_RAZER_REMOVE_HOOK:
++        if (params->in_size < sizeof(struct razer_input)) return STATUS_INVALID_PARAMETER;
++        TRACE("filter %s remove hook type %#x\n", wine_dbgstr_longlong(filter->id), input->type);
++        remove_hook(filter, input);
++        return STATUS_SUCCESS;
++
++    case IOCTL_RAZER_FIND_HOOK:
++        if (params->in_size < sizeof(struct razer_input) || params->out_size < sizeof(struct razer_hook))
++            return STATUS_INVALID_PARAMETER;
++        LIST_FOR_EACH_ENTRY_REV(entry, &filter->hooks, struct razer_hook_entry, entry)
++        {
++            if (entry->removed || !hook_equal(&entry->hook.input, input)) continue;
++            memcpy(params->out, &entry->hook, sizeof(entry->hook));
++            params->out_len = sizeof(entry->hook);
++            return STATUS_SUCCESS;
++        }
++        return STATUS_UNSUCCESSFUL;
++
++    case IOCTL_RAZER_GET_HOOK:
++        if (params->in_size < sizeof(UINT) || params->out_size < sizeof(struct razer_hook))
++            return STATUS_INVALID_PARAMETER;
++        LIST_FOR_EACH_ENTRY(entry, &filter->hooks, struct razer_hook_entry, entry)
++        {
++            if (entry->removed || index++ != *(UINT *)params->in) continue;
++            memcpy(params->out, &entry->hook, sizeof(entry->hook));
++            params->out_len = sizeof(entry->hook);
++            return STATUS_SUCCESS;
++        }
++        return STATUS_UNSUCCESSFUL;
++    }
++
++    FIXME("filter %s ioctl %#x not implemented\n", wine_dbgstr_longlong(filter->id), params->code);
++    return STATUS_NOT_SUPPORTED;
++}
++
++#else
++
++struct razer_filter *razer_filter_add(struct udev *context, struct udev_device *dev,
++                                      const struct device_desc *desc, struct list *queue)
++{
++    return NULL;
++}
++
++void razer_filter_release(struct razer_filter *filter, struct list *queue)
++{
++}
++
++BOOL razer_filter_read(int fd, struct list *queue)
++{
++    return FALSE;
++}
++
++NTSTATUS razer_filter_ioctl(struct razer_ioctl_params *params)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++void razer_filter_shutdown(void)
++{
++}
++
++#endif
+diff --git dlls/winebus.sys/unix_private.h dlls/winebus.sys/unix_private.h
+index c39c878..e71ad47 100644
+--- dlls/winebus.sys/unix_private.h
++++ dlls/winebus.sys/unix_private.h
+@@ -229,6 +229,7 @@ extern NTSTATUS sdl_bus_stop(void *);
+ extern NTSTATUS udev_bus_init(void *);
+ extern NTSTATUS udev_bus_wait(void *);
+ extern NTSTATUS udev_bus_stop(void *);
++extern NTSTATUS udev_razer_ioctl(void *);
+ 
+ extern NTSTATUS iohid_bus_init(void *);
+ extern NTSTATUS iohid_bus_wait(void *);
+@@ -241,6 +242,25 @@ extern BOOL bus_event_queue_device_created(struct list *queue, struct unix_devic
+ extern BOOL bus_event_queue_input_report(struct list *queue, struct unix_device *device,
+                                          BYTE *report, USHORT length);
+ extern BOOL bus_event_queue_pop(struct list *queue, struct bus_event *event);
++extern BOOL bus_event_queue_razer_created(struct list *queue, UINT64 filter, struct device_desc *desc);
++extern BOOL bus_event_queue_razer_removed(struct list *queue, UINT64 filter);
++extern BOOL bus_event_queue_razer_event(struct list *queue, UINT64 filter, const struct razer_event *event);
++
++/* razer_unix.c, called by bus_udev.c with its lock held */
++struct udev;
++struct udev_device;
++struct razer_filter;
++extern struct razer_filter *razer_filter_add(struct udev *udev, struct udev_device *dev,
++                                             const struct device_desc *desc, struct list *queue);
++extern void razer_filter_release(struct razer_filter *filter, struct list *queue);
++extern BOOL razer_filter_read(int fd, struct list *queue);
++extern NTSTATUS razer_filter_ioctl(struct razer_ioctl_params *params);
++extern void razer_filter_shutdown(void);
++
++/* bus_udev.c, for razer_unix.c: poll a file descriptor, and call razer_filter_read when
++ * there is something to read; once no longer polled, it is closed */
++extern BOOL udev_watch_fd(int fd);
++extern void udev_unwatch_fd(int fd);
+ 
+ extern BOOL hid_device_begin_report_descriptor(struct unix_device *iface, const USAGE_AND_PAGE *device_usage);
+ extern BOOL hid_device_end_report_descriptor(struct unix_device *iface);
+diff --git dlls/winebus.sys/unixlib.c dlls/winebus.sys/unixlib.c
+index f2b8877..b7ba81d 100644
+--- dlls/winebus.sys/unixlib.c
++++ dlls/winebus.sys/unixlib.c
+@@ -320,6 +320,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     unix_device_set_output_report,
+     unix_device_get_feature_report,
+     unix_device_set_feature_report,
++    udev_razer_ioctl,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count);
+@@ -328,6 +329,8 @@ void bus_event_cleanup(struct bus_event *event)
+ {
+     struct unix_device *iface = (struct unix_device *)(UINT_PTR)event->device;
+     if (event->type == BUS_EVENT_TYPE_NONE) return;
++    /* a Razer filter's event names it by an id, not a device it holds a reference to */
++    if (event->type >= BUS_EVENT_TYPE_RAZER_CREATED) return;
+     unix_device_decref(iface);
+ }
+ 
+@@ -409,6 +412,41 @@ BOOL bus_event_queue_input_report(struct list *queue, struct unix_device *device
+     return TRUE;
+ }
+ 
++BOOL bus_event_queue_razer_created(struct list *queue, UINT64 filter, struct device_desc *desc)
++{
++    struct bus_event_entry *entry = malloc(sizeof(*entry));
++    if (!entry) return FALSE;
++
++    entry->event.type = BUS_EVENT_TYPE_RAZER_CREATED;
++    entry->event.device = filter;
++    entry->event.device_created.desc = *desc;
++    list_add_tail(queue, &entry->entry);
++    return TRUE;
++}
++
++BOOL bus_event_queue_razer_removed(struct list *queue, UINT64 filter)
++{
++    struct bus_event_entry *entry = malloc(sizeof(*entry));
++    if (!entry) return FALSE;
++
++    entry->event.type = BUS_EVENT_TYPE_RAZER_REMOVED;
++    entry->event.device = filter;
++    list_add_tail(queue, &entry->entry);
++    return TRUE;
++}
++
++BOOL bus_event_queue_razer_event(struct list *queue, UINT64 filter, const struct razer_event *event)
++{
++    struct bus_event_entry *entry = malloc(sizeof(*entry));
++    if (!entry) return FALSE;
++
++    entry->event.type = BUS_EVENT_TYPE_RAZER_EVENT;
++    entry->event.device = filter;
++    entry->event.razer_event = *event;
++    list_add_tail(queue, &entry->entry);
++    return TRUE;
++}
++
+ BOOL bus_event_queue_pop(struct list *queue, struct bus_event *event)
+ {
+     struct list *head = list_head(queue);
+diff --git dlls/winebus.sys/unixlib.h dlls/winebus.sys/unixlib.h
+index c1975b9..3bbb2b7 100644
+--- dlls/winebus.sys/unixlib.h
++++ dlls/winebus.sys/unixlib.h
+@@ -31,6 +31,8 @@
+ #include "wine/debug.h"
+ #include "wine/list.h"
+ 
++#include "razer.h"
++
+ struct device_desc
+ {
+     UINT vid;
+@@ -76,6 +78,9 @@ enum bus_event_type
+     BUS_EVENT_TYPE_DEVICE_REMOVED,
+     BUS_EVENT_TYPE_DEVICE_CREATED,
+     BUS_EVENT_TYPE_INPUT_REPORT,
++    BUS_EVENT_TYPE_RAZER_CREATED,   /* device is a Razer filter, device_created the USB device */
++    BUS_EVENT_TYPE_RAZER_REMOVED,
++    BUS_EVENT_TYPE_RAZER_EVENT,
+ };
+ 
+ enum bus_type
+@@ -102,6 +107,8 @@ struct bus_event
+             USHORT length;
+             BYTE buffer[1];
+         } input_report;
++
++        struct razer_event razer_event;
+     };
+ };
+ 
+@@ -136,6 +143,17 @@ struct device_report_params
+     IO_STATUS_BLOCK *io;
+ };
+ 
++struct razer_ioctl_params
++{
++    UINT64 filter;
++    UINT code;
++    const void *in;
++    UINT in_size;
++    void *out;
++    UINT out_size;
++    UINT out_len;
++};
++
+ enum unix_funcs
+ {
+     sdl_init,
+@@ -155,6 +173,7 @@ enum unix_funcs
+     device_set_output_report,
+     device_get_feature_report,
+     device_set_feature_report,
++    razer_ioctl,
+     unix_funcs_count,
+ };
+ 

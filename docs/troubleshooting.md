@@ -67,33 +67,50 @@ which the log counts but does not show.
    `containerId=` and nothing after it, the Wine in use is not this project's -- patch
    23 is what gives Synapse that ID.
 
-**A button reassigned in Synapse still sends its old key** -- the mouse is in Razer's
-*driver mode*, in which it ignores the assignments stored in it and expects Razer's
-filter driver to translate its keys on the PC. Wine has no such driver, so this build
-keeps Razer devices in normal mode (patch 25 in [wine-fixes.md](wine-fixes.md)). If the
-key is still wrong, check that the switch that turns this off is not set:
+**A button reassigned in Synapse still sends its old key, or a button does nothing** --
+Synapse runs Razer devices in *driver mode*, where the firmware sends every button's
+default input and Synapse remaps it on the PC, through Razer's filter driver. Under Wine,
+winebus stands in for that driver (patch 35 in [wine-fixes.md](wine-fixes.md)): while
+Synapse runs, it takes the device's input away from the desktop, hands Synapse what it
+asks for, and passes the rest on through a copy of each of the device's input devices.
+For that it needs the device's event nodes and `/dev/uinput`, which the udev rule gives
+the seat's user -- the rule from before this was added does not:
 
 ```bash
-grep -i -A3 '^\[System\\\\ControlSet001\\\\Services\\\\winebus\]' $PFX/system.reg  # no "RazerDriverMode"=dword:00000001
+ls -l /dev/uinput /dev/input/by-id/*Razer*     # crw-rw----+ means the seat has an ACL
+getfacl -p "$(readlink -f /dev/input/by-id/usb-Razer*-event-mouse | head -1)" | grep user:
 ```
 
-and, with Synapse quit, what mode the mouse is in, if OpenRazer is installed:
+If those are missing, install the rule again as in the README, then unplug the device
+and plug it back in. With Synapse running there should be a copy of each of the device's
+input devices, under `/sys/devices/virtual/input`, with the same names:
 
 ```bash
-xxd -p /sys/bus/hid/devices/0003:1532:*/device_mode   # 0000 is normal, 0300 is driver mode
+grep -l Razer /sys/devices/virtual/input/input*/name
 ```
 
-Starting Synapse puts a mouse left in driver mode back in normal mode. Assignments only
-Synapse itself can perform -- launching programs, text, Windows shortcuts -- do not work
-under Wine at all.
+and `WINEDEBUG=+razer` in the launcher's log shows each node grabbed, each hook Synapse
+sets, and each input it takes or sends.
 
-**Synapse doesn't follow the mouse's DPI or scroll mode buttons** -- in normal mode the
-mouse makes those changes itself, and this build passes each one on to Synapse as the
-button press driver mode would have sent (patch 33 in [wine-fixes.md](wine-fixes.md)).
-That happens only while patch 25 is keeping the mouse in normal mode, so check the same
-`RazerDriverMode` switch as above. With it set the mouse really is in driver mode, and
-the buttons do nothing at all until Synapse acts on them through Razer's filter driver,
-which Wine cannot load.
+**A Razer device works, but some of its buttons never reach anything** -- even without
+Synapse running. Check that a kernel driver has not left some of its interfaces without
+one. OpenRazer's modules do that to some devices: with `razeraccessory` loaded, the Mouse
+Dock Pro (`1532:00a4`) keeps its first interface, and the other two -- where a mouse paired
+to the dock sends its side buttons and Razer keys -- get no driver at all:
+
+```bash
+journalctl -k | grep 'skipping secondary interface'
+for d in /sys/bus/usb/devices/*:1.*/0003:1532:*; do echo "$d $(basename "$(readlink -f "$d/driver")")"; done
+```
+
+An interface with no driver after it has no hidraw or input node, for Synapse or the
+desktop. Keep OpenRazer's kernel modules off those devices -- blacklist them, then unplug
+the device:
+
+```bash
+printf 'blacklist razeraccessory\nblacklist razermouse\n' | sudo tee /etc/modprobe.d/synapse-linux-no-openrazer.conf
+sudo modprobe -r razeraccessory razermouse
+```
 
 **A window, or the tray icon's flyout, is white, or keeps its old content when it is
 resized** -- App Engine is drawing it from its GPU process, which Wine cannot show
@@ -159,9 +176,10 @@ With Wine's icon off, closing Synapse's window leaves it running with nothing to
 starting it again brings the window back.
 
 **OpenRazer is installed as well** -- both talk to the device over the same channel, so
-while both are running, readings in one can come back garbled or as zero. Synapse
-re-reads the device's state as it starts. If you want Synapse to own the device, stop
-the daemon while it runs:
+while both are running, readings in one can come back garbled or as zero, and OpenRazer
+can put a device in driver mode or out of it behind Synapse's back. Synapse re-reads the
+device's state as it starts. If you want Synapse to own the device, stop the daemon while
+it runs, and see above about its kernel modules:
 
 ```bash
 systemctl --user stop openrazer-daemon

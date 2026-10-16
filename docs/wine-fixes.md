@@ -309,55 +309,6 @@ shape, and X delivers input only inside a window's bounding shape:
 rect=(0,0)-(0,0)    bounding=[]    input=[(0, 0, 1, 1)]     <- three restarts, the same each time
 ```
 
-### 25. Razer devices stay in normal mode
-
-**Symptom:** a button reassigned in Synapse -- side button 1 to `A` -- still types `1`,
-everywhere, while Synapse runs. With Synapse closed, it types `A`.
-
-**Cause:** Razer devices have a *driver mode* (`0x03`), set with command class `0x00`
-id `0x04` and read back with `0x84`. In it a mouse stops applying the button
-assignments stored in it and reports raw keys, for Razer's filter driver to translate
-on the PC (see below). Synapse's lighting engine switches every RGB device into driver
-mode as it is set up, unless Razer's online device manifest marks it
-`skipSetDriverMode`, and again whenever the device is re-initialised -- a lighting or
-profile change is enough:
-
-```
-if (E.isChromaSupported) { if (E.isPowerOn) { if (!E.skipSetDriverMode) { ...
-    await setDeviceMode({ arg1: 3, arg2: 0 })
-```
-
-Wine has no filter driver, so the raw `1` goes straight to the desktop. Synapse does
-store every assignment in the mouse's on-board profile as well
-(`taskRunnerSyncAllMappingToObm`), which the firmware applies in normal mode: with the
-mouse put back in normal mode under a running Synapse, the button types `A` and the
-lighting Synapse streams to it carries on unchanged.
-
-**Fix:** `patches/25-…` makes winebus keep Razer devices (vendor `1532`) in normal mode.
-Razer's configuration protocol is 90-byte feature reports:
-
-```
-[0] status  [1] transaction id  [2-3] remaining  [4] protocol  [5] data size
-[6] command class  [7] command id  [8-87] arguments  [88] crc (XOR of 2-87)  [89] reserved
-```
-
-* a *set device mode* request for driver mode goes to the device as normal mode;
-* the device's answers to *set* and *get device mode* are reported back as driver mode,
-  with the crc recomputed, so Synapse believes what it asked for and does not keep
-  asking;
-* a device found already in driver mode -- left that way by a session that did not get
-  to restore it, here or under Windows -- is put back in normal mode the first time an
-  application reads its mode.
-
-```
-set [..,0,4,3,..]   ->  winebus: keeping "/dev/hidraw10" in normal mode instead of driver mode
-get [..,0,4,3,..]       (the device said 0; Synapse is told 3)
-```
-
-Synapse's own restore when it quits (`configureDevicesDefaultData`, normal mode) passes
-through untouched. The `RazerDriverMode` bus option
-(`HKLM\System\CurrentControlSet\Services\WineBus`, `REG_DWORD` 1) turns all of this off.
-
 ### 26. A device that is gone is not in the present set
 
 **Symptom:** after one Razer device is swapped for another -- a Naga V2 Pro for a Naga
@@ -572,54 +523,6 @@ that may set the foreground window can let another one do so, once. Explorer's t
 calls it for an icon's owner before relaying a click, and the menu opens on every
 right-click.
 
-### 33. What the mouse changes by itself reaches Synapse
-
-**Symptom:** the mouse's DPI buttons change its sensitivity, and its scroll mode button
-switches the wheel between tactile and free-spin, but Synapse goes on showing the stage
-and the mode it set last.
-
-**Cause:** this is the other side of patch 25. In driver mode, the mode Synapse believes
-the mouse is in, its firmware does nothing about those buttons: it reports them as Razer
-keys -- report 4, `0x20` sensitivity up, `0x21` down, `0x54` scroll mode -- and Synapse
-works out the next stage or mode itself, writes it to the mouse and shows it. Kept in
-normal mode, the mouse acts on the buttons itself, and says what it did in a notification
-on the same interface:
-
-```
-05 02 0c 80 0c 80 ...    sensitivity changed: 3200 x 3200
-05 39 01 ...             scroll mode changed: 0 tactile, 1 free-spin, 2 precision tactile
-```
-
-Synapse parses these and acts on neither. Its own path doesn't need Razer's filter driver
-after all: the mapping engine reads report 4 straight from the HID device too, and turns
-a key into the `unsupportedmapping` event the device page steps the stage on.
-
-**Fix:** while an application believes a Razer device to be in driver mode, winebus turns
-a change the device made by itself into the key press that driver mode would have sent,
-and passes the notification on as well:
-
-```
-05 02 0c 80 ...   ->  04 20 00 ... then 04 00 ...     sensitivity 1600 -> 3200, stage 2 -> 3
-05 39 01 ...      ->  04 54 00 ... then 04 00 ...     scroll mode 0 -> 1
-```
-
-Synapse then steps as it would have on Windows -- the stage, its popup and the scroll mode
-selector all follow the mouse -- and writes the result back, which the device already has.
-Telling a change the user made on the mouse from one the application asked for takes knowing
-what the device was set to, so winebus follows the application's requests to the control
-interface and the device's answers to them, for the active profile: sensitivity
-(class `0x04`, `0x05` and `0x85`), the stage table (`0x06` and `0x86`, whose stage ids
-count from 0 in a request and from 1 in an answer) and the scroll mode (class `0x02`,
-`0x30` and `0xb0`). A notification that only repeats what was asked for presses nothing.
-Which way a sensitivity change went is read off the stage table, so stepping on from the
-last stage back to the first is a step up.
-
-Synapse picks the next scroll mode by its own rule, back and forth between the ends --
-tactile, free-spin, precision, free-spin, tactile -- which is what the Naga V3 Pro's
-firmware does too. Were the two ever to disagree, Synapse's choice is the one written to
-the mouse, as on Windows. A mouse whose DPI buttons have been swapped in Synapse steps
-Synapse the opposite way to the mouse, which then follows Synapse.
-
 ### 34. A message-only window made as Wine starts up stays message-only
 
 **Symptom:** starting Synapse while it is already running -- from the application menu,
@@ -647,29 +550,113 @@ makes a child of the desktop, and since it had a desktop window cached, never as
 in steps of 10 ms, for up to a second, after which it has the server create one -- before
 creating the window.
 
+### 35. Razer's filter driver, done by winebus
+
+**Symptom:** Synapse puts every RGB device it sets up into *driver mode* (`0x03`, command
+class `0x00` id `0x04`), in which the firmware stops applying the assignments stored in
+it and sends each button's default input instead, for the PC to remap. Under Wine nothing
+did: a side button sent its default key whatever it was assigned, and the buttons that
+have no key of their own -- the sensitivity and scroll mode buttons -- did nothing at all.
+Synapse's mapping engine said why, every few seconds:
+
+```
+MappingEngineInputDevice::ProbeFilterDriverEndpointOnDeviceThread: ... error[fail to probe filter driver]
+```
+
+Two earlier patches worked round it. 25 kept devices in normal mode, so the firmware
+applied the assignments Synapse also stores on the device, and 33 turned the changes the
+firmware then made by itself back into the button presses Synapse expected. That covered
+only what a device can do on its own, and every feature that reports back needed the
+same treatment one at a time: what only the PC can do -- assignments a device cannot
+store, PC-side macros, text, Synapse's scrolling features -- never worked. This patch
+replaces both, and lets Synapse run devices the way it does on Windows.
+
+**How it works on Windows:** two Razer kernel drivers, which Synapse's device modules
+install.
+
+* `RzDev_<pid>.sys` is a KMDF filter its INFs put above the device's HID keyboard and mouse
+  collections (and below its USB interfaces). It sees every `KEYBOARD_INPUT_DATA` and
+  `MOUSE_INPUT_DATA` before the system does, and it creates a child device for each:
+  `RZCONTROL\VID_1532&PID_<pid>&MI_<nn>`, compatible ID `RAZER\DeviceContol`.
+* `RzCommon.sys` binds to those children and gives applications the *Razer Control Device*,
+  interface class `{e3be005d-d130-4910-88ff-09ae02f680e9}`.
+
+The mapping engine (`mapping_engine.dll`) enumerates that interface class, keeps the
+devices whose container ID is its device's and whose path names its PID, and opens them.
+Through `0x8888xxxx` IOCTLs it then asks for
+
+* *hooks* -- particular inputs, a key by scan code or a mouse button by its flag bits, with
+  the modifier keys held: the filter holds those back and queues them as events;
+* *redirection* of every keyboard or mouse input, held back likewise;
+* *notification*: copies of every input, which go on to the system as usual;
+
+and reads the events with a request that stays pending until there is one, a 0x130-byte
+record. What it makes of them it injects back through `IOCTL 0x88883020`, as keyboard or
+mouse input the filter hands on as if the device had sent it. With Synapse's wheel
+features, for one, every wheel notch is hooked and Synapse sends its own scrolling back.
+
+Wine can load neither driver -- there is no KMDF -- and the input never passes through
+Wine anyway: the desktop reads it from the kernel's evdev nodes.
+
+**Fix:** winebus does both drivers' job, behind the same interface.
+
+* For each Razer USB device it has hidraw nodes for, winebus adds a child to its bus:
+  `RZCONTROL\VID_1532&PID_<pid>&MI_00`, without the compatible ID, so no driver is installed
+  for it. It is a raw device (`RawDeviceOK`), started as such, and has the device's
+  container ID and the control device's interface. It answers RzCommon's requests: which
+  events each handle receives, the hook table, redirection, the pending reads, input to
+  inject.
+* Its Unix side takes the device's input over for as long as some handle wants hooks or
+  redirection. It grabs the device's evdev nodes (`EVIOCGRAB`), so the desktop no longer
+  reads them, and creates a uinput device for each that copies it -- name, IDs, keys, axes,
+  LEDs -- so the desktop applies its settings for the device to the copy. It waits to grab
+  a node while one of its keys is down, since the desktop would never see that key come
+  up, and hands the LEDs the desktop sets on a copy on to the device, which takes them only
+  from whoever holds the grab. A handle that only wants notification gets it without a
+  grab. Each frame read from a
+  node becomes `KEYBOARD_INPUT_DATA` (set 1 scan codes, `E0` and `E1` flags) or
+  `MOUSE_INPUT_DATA` (button flags, the wheels a notch at a time), and goes through the same
+  steps as in `RzCommon.sys`: redirection, notification, then the hook table -- a release
+  goes to the hook that took the press, a press to the hook for exactly the modifiers held,
+  then for a subset of them, then for none. What no hook takes goes on to the copy in the
+  same frame, and pointer movement always does. When evdev reports lost events, the keys
+  known to be down are brought back in line with the device, so nothing stays held. Input
+  the mapping engine injects goes out through a copy that has the key or axis.
+* When the last handle closes -- Synapse quitting, or its process ending -- the hook table is
+  cleared, the nodes are let go and the copies removed, and the device is the desktop's
+  again.
+
+With a Naga V3 Pro on the Mouse Dock Pro, as Synapse connects:
+
+```
+control 00007FFFFF30BFF0 is L"\\??\\RZCONTROL#VID_1532&PID_00A4&MI_00#8&5501&0200000000000000#{e3be005d-...}"
+filter 1 subscriptions 0x6                          hooks and notification
+grabbed "/dev/input/event6" "Razer Razer Mouse Dock Pro", keyboard 0     ... and four more
+filter 1 add hook type 0x2 unit 0 buttons 0x400 data 0xff88 modifiers 0    a wheel notch down
+filter 1 kind 0x2 type 0x2 buttons 0x400 data 0xff88                       ... hooked
+filter 1 mouse flags 0 buttons 0x400 data 0xff88                           and Synapse's own, sent back
+filter 1 key 0x1a down                              a button assigned "[" in Synapse
+```
+
+`WINEDEBUG=+razer` shows all of this. Passing input on costs nothing measurable: at the
+mouse's 8000 Hz, the dock's hidraw node and the copy the desktop reads both showed 32,186
+reports in five seconds of circles, 125 µs apart, one frame lost to the start of the
+measurement.
+
+The buttons with no key of their own still reach Synapse the way they did: the firmware
+reports them as Razer keys (`04 20`, `04 21`, `04 54`) on the device's vendor collection,
+which the mapping engine reads from HID itself, and the desktop ignores.
+
+This needs two more lines in the udev rule: the evdev nodes of Razer devices and
+`/dev/uinput`, for the seat's user (see `udev/60-razer-synapse.rules`). Without them
+winebus logs why, and the device stays in driver mode with nothing to remap it.
+
+What is not done, and logs a FIXME when Synapse asks for it: redirection of pointer
+movement (which Razer's driver takes from below the HID stack), absolute pointer
+movement, gamepad and raw consumer-control output, and sensor rotation, which Razer's
+drivers for these devices do not do either.
+
 ## Things that are not fixed, and why
-
-### Razer's filter driver, and driver mode
-
-Synapse's device modules install Razer's per-device kernel drivers -- for the Naga V2
-Pro, `RzDev_00a7.sys`, attached by its INFs as an upper filter on the HID mouse and a
-lower filter on the USB interface. Wine's PnP manager never loads upper or lower
-filters, so the driver can neither attach nor do any harm. Razer's mapping engine is
-configured with `connectFilterDriver: true`, logs `fail to probe filter driver`, and
-keeps retrying for as long as Synapse runs.
-
-On Windows the filter is half of PC-side remapping: with the device in driver mode it
-hands the mapping engine the raw button presses and swallows them, and the mapping
-engine acts on them -- with `SendInput`, low-level hooks and raw input. Patch 25 keeps
-devices out of driver mode instead, so their firmware applies the assignments Synapse
-stores in them, and patch 33 passes on to Synapse what the firmware then changes by
-itself. What that leaves out is whatever only the PC side can do -- PC-side
-macros, launching programs, text, Windows shortcuts. Making those work would take three
-things: grabbing the device's evdev nodes so the desktop stops seeing the raw presses,
-emulating the filter driver's interface to the mapping engine (a private protocol,
-still to be reverse-engineered), and carrying `SendInput` out of Wine to a uinput
-device, since inside Wine it reaches only Windows programs. The `RazerDriverMode` bus
-option is the switch that would hand driver mode back to Synapse for that.
 
 ### Razer Game Manager Service
 

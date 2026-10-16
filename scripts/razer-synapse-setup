@@ -36,23 +36,26 @@ die() { printf 'ERROR: %s\n' "$*" >&2; step_done; exit 1; }
 udev_help() {
     cat <<HELP
 Razer devices stay owned by root until a udev rule says otherwise, and Wine cannot open
-one without it -- Synapse runs, and finds no devices. A Flatpak cannot install the rule
-for you, so this is the one step that needs root on the host.
+one without it -- Synapse runs, and finds no devices. The same rule gives you the devices'
+input event nodes and /dev/uinput, without which Synapse cannot remap their buttons. A
+Flatpak cannot install the rule for you, so this is the one step that needs root on the
+host.
 
 Run this in a terminal on the host:
 
   flatpak run --command=razer-synapse-setup $APPID --udev-rule \\
     | sudo tee /etc/udev/rules.d/60-razer-synapse.rules >/dev/null
   sudo udevadm control --reload-rules
-  sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb
+  sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb \\
+    --subsystem-match=input --subsystem-match=misc
 
-The rule itself is two lines, and is also in the repository at udev/60-razer-synapse.rules:
+The rule itself is four lines, and is also in the repository at udev/60-razer-synapse.rules:
 
 $(sed 's/^/  /' "$SHARE/60-razer-synapse.rules" 2>/dev/null | grep -v '^  #' | grep -v '^  $')
 
-Anything that already ships a rule for Razer's vendor id has covered this -- OpenRGB
-does, and OpenRazer does for the devices it supports -- which is why the problem does
-not show up on every machine.
+Anything that already ships a rule for Razer's vendor id has covered the first two --
+OpenRGB does, and OpenRazer does for the devices it supports -- which is why the problem
+does not show up on every machine.
 HELP
 }
 

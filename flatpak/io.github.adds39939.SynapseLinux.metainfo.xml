@@ -25,8 +25,8 @@
           which side plate is fitted</li>
       <li>Changes are written back to the mouse, confirmed by reading them back
           independently</li>
-      <li>Button assignments apply everywhere on the desktop, through the mouse's own
-          firmware</li>
+      <li>Button assignments apply everywhere on the desktop: Synapse runs the mouse in
+          driver mode and remaps it on the PC, as on Windows</li>
       <li>Lighting effects and brightness</li>
       <li>The interface scales to match your desktop</li>
     </ul>
@@ -37,10 +37,9 @@
     </p>
     <p>
       One step needs root on the host and cannot be done from inside the sandbox:
-      installing a udev rule so that Razer devices are readable by your user. Run
-      "flatpak run --command=razer-synapse-setup io.github.adds39939.SynapseLinux
-      --udev-help" for the exact commands. If you already use OpenRGB, its rule covers
-      it.
+      installing a udev rule so that Razer devices, and their input devices, are
+      reachable by your user. Run "flatpak run --command=razer-synapse-setup
+      io.github.adds39939.SynapseLinux --udev-help" for the exact commands.
     </p>
   </description>
 
