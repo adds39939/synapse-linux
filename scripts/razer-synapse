@@ -126,8 +126,12 @@ fi
 # Test the Razer device's own hidraw nodes, not just any of them: a keyboard or game
 # controller carries uaccess on most desktops, so asking whether some /dev/hidraw* is
 # readable would pass on every machine that had one.
+#
+# Remapping buttons takes the device's input event nodes and /dev/uinput as well (see
+# docs/wine-fixes.md, patch 35), which a rule from before that does not give -- Synapse
+# then finds the device, and nothing remaps it.
 check_device_access() {
-  local dev node found=0 blocked=0
+  local dev node found=0 blocked=0 noinput=0
   for dev in /sys/bus/hid/devices/*; do
     case "${dev##*/}" in *:1532:*) ;; *) continue ;; esac
     found=1
@@ -136,19 +140,32 @@ check_device_access() {
       node="/dev/${node##*/}"
       { [ -r "$node" ] && [ -w "$node" ]; } || blocked=1
     done
+    for node in "$dev"/input/input*/event*; do
+      [ -e "$node" ] || continue
+      node="/dev/input/${node##*/}"
+      [ -r "$node" ] || noinput=1
+    done
   done
   [ "$found" = 1 ] || return 0          # no Razer device attached; nothing to say
-  [ "$blocked" = 1 ] || return 0        # its own nodes are reachable
+  [ -w /dev/uinput ] || noinput=1
+  [ "$blocked" = 1 ] || [ "$noinput" = 1 ] || return 0   # all reachable
 
   # Not "cp /app/...": /app exists only inside the sandbox, and the shell the user runs
   # sudo in does not have it. Pipe the rule out instead.
   local cmd="flatpak run --command=razer-synapse-setup $APPID --udev-rule \\
   | sudo tee /etc/udev/rules.d/60-razer-synapse.rules >/dev/null
 sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb"
+sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb --subsystem-match=input --subsystem-match=misc"
+  local what="Razer Synapse cannot reach your device."
+  [ "$blocked" = 1 ] || what="Razer Synapse cannot remap your device's buttons: it needs its input devices and /dev/uinput."
 
-  echo "razer-synapse: a Razer device is attached but its /dev/hidraw* is not accessible." >&2
-  echo "razer-synapse: Synapse will start and find nothing. On the host, run:" >&2
+  if [ "$blocked" = 1 ]; then
+    echo "razer-synapse: a Razer device is attached but its /dev/hidraw* is not accessible." >&2
+    echo "razer-synapse: Synapse will start and find nothing. On the host, run:" >&2
+  else
+    echo "razer-synapse: a Razer device's input event nodes or /dev/uinput are not accessible." >&2
+    echo "razer-synapse: Synapse will not be able to remap its buttons. On the host, run:" >&2
+  fi
   printf 'razer-synapse:   %s\n' "$cmd" >&2
 
   # A text-info dialog rather than a warning box: the text can be selected and copied,
@@ -156,12 +173,12 @@ sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb"
   if command -v zenity >/dev/null 2>&1 &&
      { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then
     printf '%s\n\n%s\n' \
-      "Razer Synapse cannot reach your device. Run this in a terminal, then restart Synapse:" \
+      "$what Run this in a terminal, then restart Synapse:" \
       "$cmd" |
     zenity --text-info --title="Razer Synapse needs one step on the host" \
            --width=720 --height=230 >/dev/null 2>&1 || true
   else
-    notify-send -a "Razer Synapse" -u critical "Razer Synapse cannot reach your device" \
+    notify-send -a "Razer Synapse" -u critical "$what" \
       "A udev rule is needed. Run:  flatpak run --command=razer-synapse-setup $APPID --udev-help" \
       2>/dev/null || true
   fi
