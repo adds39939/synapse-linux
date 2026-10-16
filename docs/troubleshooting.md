@@ -87,6 +87,26 @@ Starting Synapse puts a mouse left in driver mode back in normal mode. Assignmen
 Synapse itself can perform -- launching programs, text, Windows shortcuts -- do not work
 under Wine at all.
 
+**Synapse doesn't follow the mouse's DPI or scroll mode buttons** -- in normal mode the
+mouse makes those changes itself, and this build passes each one on to Synapse as the
+button press driver mode would have sent (patch 33 in [wine-fixes.md](wine-fixes.md)).
+That happens only while patch 25 is keeping the mouse in normal mode, so check the same
+`RazerDriverMode` switch as above. With it set the mouse really is in driver mode, and
+the buttons do nothing at all until Synapse acts on them through Razer's filter driver,
+which Wine cannot load.
+
+**A window, or the tray icon's flyout, is white, or keeps its old content when it is
+resized** -- App Engine is drawing it from its GPU process, which Wine cannot show
+reliably for a window of another process. The launcher starts App Engine with
+`--disable-gpu-compositing` to avoid that ([wine-fixes.md](wine-fixes.md) has why); App
+Engine started by Razer's installer, at the end of the first install, or by its updater,
+runs without it. Quit Synapse from its tray menu and start it again. To see whether the
+running App Engine has the switch:
+
+```bash
+pgrep -af -- '--url-params=apps=synapse'   # the main process; look for --disable-gpu-compositing
+```
+
 **"SERVER ACCESS UNAVAILABLE" in Razer's installer**, with the network fine -- the
 prefix is set to a Windows version older than 10, and Razer offers Synapse 4 to
 Windows 10 and later only. The installer's log says which it reported:

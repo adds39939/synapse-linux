@@ -1,0 +1,32 @@
+diff --git dlls/win32u/window.c dlls/win32u/window.c
+index 94086a7..8d28165 100644
+--- dlls/win32u/window.c
++++ dlls/win32u/window.c
+@@ -528,8 +528,27 @@ BOOL is_client_surface_window( struct client_surface *surface, HWND hwnd )
+ HWND get_hwnd_message_parent(void)
+ {
+     struct user_thread_info *thread_info = get_user_thread_info();
++    unsigned int i;
+ 
+     if (!thread_info->msg_window) get_desktop_window(); /* trigger creation */
++
++    /* The desktop process creates the HWND_MESSAGE parent just after the desktop window, and
++     * a thread that found the desktop window in between was told there is no HWND_MESSAGE
++     * parent. Wait for it rather than create the window as a top-level one, where nothing
++     * looking for it with FindWindowEx( HWND_MESSAGE ) would find it. */
++    for (i = 0; !thread_info->msg_window && i <= 100; i++)
++    {
++        LARGE_INTEGER timeout = {.QuadPart = -10 * 10000}; /* 10 ms */
++
++        if (i < 100) NtDelayExecution( FALSE, &timeout );
++        SERVER_START_REQ( get_desktop_window )
++        {
++            req->force = (i == 100); /* the desktop process never made one: have it created */
++            if (!wine_server_call( req )) thread_info->msg_window = wine_server_ptr_handle( reply->msg_window );
++        }
++        SERVER_END_REQ;
++    }
++    if (i) TRACE( "waited %u times for the HWND_MESSAGE parent %p\n", i, thread_info->msg_window );
+     return thread_info->msg_window;
+ }
+ 

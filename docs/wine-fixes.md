@@ -115,6 +115,38 @@ device pixel ratio and renders at that scale, so the result is sharp rather than
 100% window stretched by the compositor. The setup applies it before Razer's installer
 opens, so the installer comes up at the right size too; WPF scales by system DPI.
 
+### Software compositing -- white and stale windows
+
+**Symptom:** the flyout that opens from Synapse's tray icon is a white box, or nothing at
+all. A window maximized by dragging it to the top of the screen grows, but what is in it
+stays the size it was -- until the pointer happens to move over it, sometimes.
+
+**Cause:** App Engine is Chromium, and Chromium draws its windows from its GPU process,
+with Direct3D 11 -- wined3d on OpenGL here -- into windows that belong to another
+process, the browser process. Wine draws into a window of the same process directly,
+but into one of another process only offscreen: into a GL window of its own, which it
+copies into the real one after each frame. Two things go wrong with that:
+
+* the GPU process only renders offscreen while the window is clipped by another one.
+  Otherwise it renders into a GL window that it cannot attach to a window of another
+  process, and nothing it draws reaches the screen: a window never drawn stays blank, and
+  one that has changed size keeps the last frame that was copied;
+* offscreen, the copy is taken as the frame is swapped. Wine's GLX path waits for the
+  swap to complete first (`glXWaitForSbcOML`); its EGL path, which it takes with NVIDIA's
+  driver, does not, and copies the frame before. Right after a resize that is the frame
+  drawn for the old size, and Chromium, which only draws when something changes, may not
+  draw another.
+
+**Fix:** none in Wine. The launcher starts App Engine with `--disable-gpu-compositing`,
+which has Chromium's browser process paint each of its windows itself, with GDI, as any
+Win32 program does. Its transparent windows, like the flyout, become layered windows,
+which Wine draws with their alpha channel. Synapse's pages are mostly still: maximized
+on a 4K panel it takes about 2% of a core.
+
+App Engine started by Razer's own installer or updater rather than by the launcher --
+once, at the end of the first install -- runs without the switch until it is next started
+from the launcher.
+
 ## The patches
 
 ### 21. A process still being created must not be listed
@@ -473,6 +505,148 @@ What is left of NVIDIA's driver in the GPU process is 38 MB mapped from
 `/dev/nvidiactl`, down from 165 MB. Its largest remaining allocation is 49 MB of pixel
 data in a Unix-side malloc arena, which grows with what the window drew while it was open.
 
+### 31. A window that draws its own frame gets no title bar from the desktop
+
+**Symptom:** maximized, Synapse gets the desktop's title bar across its top, over its
+own -- its tabs, and its minimize, maximize and close buttons, half hidden underneath.
+
+**Cause:** Synapse's window is a frameless Electron window with the `WS_CAPTION` and
+`WS_THICKFRAME` styles: Chromium answers `WM_NCCALCSIZE` with a client area the size of
+the whole window and draws a title bar of its own inside it. winex11 asks the window
+manager for decorations only for a window that has a non-client area, and a normal
+Synapse window has none. A maximized one does. On Windows a maximized window overhangs
+the monitor by its frame on every side, and Chromium leaves that frame -- 4 pixels here
+-- around the client area, for Windows to put off the screen:
+
+```
+window (-4,-4)-(3844,2164)    client (0,0)-(3840,2158)
+```
+
+That was enough for winex11 to decorate the window the way its style asks for, with a
+title bar, buttons and a border. Wine leaves the window manager the non-client area those
+take, 41 pixels at the top here, and KDE drew its title bar over the top 37 pixels of
+Synapse's client area.
+
+**Fix:** win32u decides that a window draws its own frame when the decorations its style
+asks for would cover part of its client area, and says so to the driver with a new
+`WINE_SWP_CUSTOM_FRAME` flag; winex11 then asks for no decorations. A maximized one is
+shown only over the area it is maximized to, the monitor's work area -- where Windows
+shows it too, its frame being off the screen:
+
+```
+window (-4,-4)-(3844,2164)    client (0,0)-(3840,2158)    X window 3840x2160, no decorations
+```
+
+Windows with frames of the usual kind are unaffected: Notepad keeps KDE's title bar,
+normal and maximized.
+
+### 32. A click on a tray icon lets its owner come to the front
+
+**Symptom:** right-clicking Synapse's tray icon opens its menu now and then, and more often
+does nothing.
+
+**Cause:** Electron shows a tray icon's menu only once it has made its own window the
+foreground window, and gives up if it cannot:
+
+```cpp
+if (!SetForegroundWindow(window_)) return;
+```
+
+Wine 11 has a foreground lock, as Windows does: a process may take the foreground only if
+its last input is no older than that of the process in the foreground. A click on a tray
+icon is input for Wine's explorer, whose window the icon is, so the application the click
+is meant for is turned away:
+
+```
+explorer  set_foreground_window hwnd 0x100fc, mouse 1 -> ret 1     the click
+Synapse   set_foreground_window hwnd 0x100fa, mouse 0 -> ret 0     before showing the menu
+```
+
+The menu did open when Synapse happened to have had input more recently, as on the
+first right-click after using its window. On Windows the taskbar grants the icon's owner
+the right as it passes the click on. `AllowSetForegroundWindow`, the call for that, was a
+stub in Wine, and explorer never made it.
+
+**Fix:** `AllowSetForegroundWindow` is implemented, with a new server request: a process
+that may set the foreground window can let another one do so, once. Explorer's tray
+calls it for an icon's owner before relaying a click, and the menu opens on every
+right-click.
+
+### 33. What the mouse changes by itself reaches Synapse
+
+**Symptom:** the mouse's DPI buttons change its sensitivity, and its scroll mode button
+switches the wheel between tactile and free-spin, but Synapse goes on showing the stage
+and the mode it set last.
+
+**Cause:** this is the other side of patch 25. In driver mode, the mode Synapse believes
+the mouse is in, its firmware does nothing about those buttons: it reports them as Razer
+keys -- report 4, `0x20` sensitivity up, `0x21` down, `0x54` scroll mode -- and Synapse
+works out the next stage or mode itself, writes it to the mouse and shows it. Kept in
+normal mode, the mouse acts on the buttons itself, and says what it did in a notification
+on the same interface:
+
+```
+05 02 0c 80 0c 80 ...    sensitivity changed: 3200 x 3200
+05 39 01 ...             scroll mode changed: 0 tactile, 1 free-spin, 2 precision tactile
+```
+
+Synapse parses these and acts on neither. Its own path doesn't need Razer's filter driver
+after all: the mapping engine reads report 4 straight from the HID device too, and turns
+a key into the `unsupportedmapping` event the device page steps the stage on.
+
+**Fix:** while an application believes a Razer device to be in driver mode, winebus turns
+a change the device made by itself into the key press that driver mode would have sent,
+and passes the notification on as well:
+
+```
+05 02 0c 80 ...   ->  04 20 00 ... then 04 00 ...     sensitivity 1600 -> 3200, stage 2 -> 3
+05 39 01 ...      ->  04 54 00 ... then 04 00 ...     scroll mode 0 -> 1
+```
+
+Synapse then steps as it would have on Windows -- the stage, its popup and the scroll mode
+selector all follow the mouse -- and writes the result back, which the device already has.
+Telling a change the user made on the mouse from one the application asked for takes knowing
+what the device was set to, so winebus follows the application's requests to the control
+interface and the device's answers to them, for the active profile: sensitivity
+(class `0x04`, `0x05` and `0x85`), the stage table (`0x06` and `0x86`, whose stage ids
+count from 0 in a request and from 1 in an answer) and the scroll mode (class `0x02`,
+`0x30` and `0xb0`). A notification that only repeats what was asked for presses nothing.
+Which way a sensitivity change went is read off the stage table, so stepping on from the
+last stage back to the first is a step up.
+
+Synapse picks the next scroll mode by its own rule, back and forth between the ends --
+tactile, free-spin, precision, free-spin, tactile -- which is what the Naga V3 Pro's
+firmware does too. Were the two ever to disagree, Synapse's choice is the one written to
+the mouse, as on Windows. A mouse whose DPI buttons have been swapped in Synapse steps
+Synapse the opposite way to the mouse, which then follows Synapse.
+
+### 34. A message-only window made as Wine starts up stays message-only
+
+**Symptom:** starting Synapse while it is already running -- from the application menu,
+say -- does nothing: the running copy never brings its window back from the tray. Some
+sessions only; in others it works.
+
+**Cause:** App Engine is single-instance the way Chromium is. The first copy creates a
+message-only window named after its profile directory, and a second copy finds it with
+`FindWindowEx( HWND_MESSAGE, ... )`, sends it its command line and exits. In the sessions
+where nothing happened, the first copy's window was not message-only at all, but an
+ordinary top-level window, which `FindWindowEx( HWND_MESSAGE )` does not look among:
+
+```
+window 0x1006a   parent 0x2004c class "#32769"     the desktop window, not the message parent
+```
+
+A message-only window goes under the desktop's message parent, which Wine's explorer
+creates as it starts, just after the desktop window itself. win32u asks the server for
+both and caches the answer per thread. App Engine created its window while explorer was
+still starting -- between the two -- and was told there was a desktop window and no message
+parent. It cached the desktop window, created the window with no parent, which the server
+makes a child of the desktop, and since it had a desktop window cached, never asked again.
+
+**Fix:** a thread told there is no message parent yet waits for explorer to create it --
+in steps of 10 ms, for up to a second, after which it has the server create one -- before
+creating the window.
+
 ## Things that are not fixed, and why
 
 ### Razer's filter driver, and driver mode
@@ -488,7 +662,8 @@ On Windows the filter is half of PC-side remapping: with the device in driver mo
 hands the mapping engine the raw button presses and swallows them, and the mapping
 engine acts on them -- with `SendInput`, low-level hooks and raw input. Patch 25 keeps
 devices out of driver mode instead, so their firmware applies the assignments Synapse
-stores in them. What that leaves out is whatever only the PC side can do -- PC-side
+stores in them, and patch 33 passes on to Synapse what the firmware then changes by
+itself. What that leaves out is whatever only the PC side can do -- PC-side
 macros, launching programs, text, Windows shortcuts. Making those work would take three
 things: grabbing the device's evdev nodes so the desktop stops seeing the raw presses,
 emulating the filter driver's interface to the mapping engine (a private protocol,

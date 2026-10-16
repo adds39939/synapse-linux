@@ -1,0 +1,139 @@
+diff --git dlls/win32u/window.c dlls/win32u/window.c
+index 80e763b..94086a7 100644
+--- dlls/win32u/window.c
++++ dlls/win32u/window.c
+@@ -2112,22 +2112,61 @@ done:
+ }
+ 
+ 
+-static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style, const struct window_rects *rects )
++/* the visible rect left by the host decorations the window style asks for */
++static BOOL get_decorated_rect( HWND hwnd, UINT style, UINT ex_style, const RECT *window_rect, RECT *visible_rect )
+ {
+     struct ratio dpi = get_dpi_for_window( hwnd );
+     UINT style_mask, ex_style_mask;
++    RECT rect = {0};
++
++    if (!user_driver->pGetWindowStyleMasks( hwnd, style, ex_style, &style_mask, &ex_style_mask )) return FALSE;
++    if (!adjust_window_rect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, round_dpi( dpi ) )) return FALSE;
++
++    *visible_rect = *window_rect;
++    visible_rect->left   -= rect.left;
++    visible_rect->right  -= rect.right;
++    visible_rect->top    -= rect.top;
++    visible_rect->bottom -= rect.bottom;
++    return TRUE;
++}
++
++/* a window whose client area the host decorations would cover draws its own frame: it has a
++ * non-client area, but not the one its style describes. Chromium's maximized frameless windows,
++ * for one, keep a thin border around the client area for Windows to put off-screen. */
++static BOOL has_custom_frame( HWND hwnd, UINT style, UINT ex_style, const struct window_rects *rects )
++{
++    RECT visible_rect;
++
++    if (IsRectEmpty( &rects->window ) || IsRectEmpty( &rects->client ) || !decorated_mode) return FALSE;
++    if (EqualRect( &rects->window, &rects->client )) return FALSE;
++    if (!get_decorated_rect( hwnd, style, ex_style, &rects->window, &visible_rect )) return FALSE;
++    return rects->client.left < visible_rect.left || rects->client.top < visible_rect.top ||
++           rects->client.right > visible_rect.right || rects->client.bottom > visible_rect.bottom;
++}
++
++static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style, const struct window_rects *rects )
++{
+     RECT visible_rect, rect = {0};
+ 
+     if (get_present_rect( hwnd, &rect, get_thread_dpi() )) return rect;
+     if (IsRectEmpty( &rects->window ) || EqualRect( &rects->window, &rects->client ) || shaped || !decorated_mode) return rects->window;
+-    if (!user_driver->pGetWindowStyleMasks( hwnd, style, ex_style, &style_mask, &ex_style_mask )) return rects->window;
+-    if (!adjust_window_rect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, round_dpi( dpi ) )) return rects->window;
+-
+-    visible_rect = rects->window;
+-    visible_rect.left   -= rect.left;
+-    visible_rect.right  -= rect.right;
+-    visible_rect.top    -= rect.top;
+-    visible_rect.bottom -= rect.bottom;
++    if (has_custom_frame( hwnd, style, ex_style, rects ))
++    {
++        MONITORINFO info;
++
++        if (!(style & WS_MAXIMIZE)) return rects->window;
++        /* the frame of a maximized window lies outside of the area it is maximized to, where
++         * Windows doesn't show it either */
++        info = monitor_info_from_rect( rects->window, get_thread_dpi() );
++        if (style & WS_MAXIMIZEBOX && (style & WS_CAPTION) == WS_CAPTION) rect = info.rcWork;
++        else rect = info.rcMonitor;
++        if (!intersect_rect( &visible_rect, &rects->window, &rect )) return rects->window;
++        TRACE( "hwnd %p, rects %s, maximized with its own frame -> visible_rect %s\n", hwnd,
++               debugstr_window_rects( rects ), wine_dbgstr_rect( &visible_rect ) );
++        return visible_rect;
++    }
++    if (!get_decorated_rect( hwnd, style, ex_style, &rects->window, &visible_rect )) return rects->window;
++
+     if (visible_rect.top >= visible_rect.bottom) visible_rect.bottom = visible_rect.top + 1;
+     if (visible_rect.left >= visible_rect.right) visible_rect.right = visible_rect.left + 1;
+ 
+@@ -2467,6 +2506,10 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+         if (!owner_hint) owner_hint = NtUserWindowFromPoint(new_rects->window.left - 1, new_rects->window.top - 1);
+         if (owner_hint) owner_hint = NtUserGetAncestor(owner_hint, GA_ROOT);
+ 
++        if (!is_child && has_custom_frame( hwnd, get_window_long( hwnd, GWL_STYLE ),
++                                           get_window_long( hwnd, GWL_EXSTYLE ), new_rects ))
++            swp_flags |= WINE_SWP_CUSTOM_FRAME;
++
+         user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
+                                         get_driver_window_surface( new_surface, raw_dpi ) );
+         update_client_surfaces( toplevel );
+diff --git dlls/winex11.drv/window.c dlls/winex11.drv/window.c
+index edbaaf5..34edd28 100644
+--- dlls/winex11.drv/window.c
++++ dlls/winex11.drv/window.c
+@@ -507,6 +507,7 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style
+ static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD style, DWORD ex_style )
+ {
+     if (EqualRect( &data->rects.window, &data->rects.visible )) return 0;
++    if (data->custom_frame) return 0;
+     return get_mwm_decorations_for_style( style, ex_style );
+ }
+ 
+@@ -1837,6 +1838,8 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags,
+         *state_cmd = window_update_client_state( data );
+         *swp_flags = window_update_client_config( data );
+         *rect = window_rect_from_visible( &data->rects, data->current_state.rect );
++        /* the frame of a maximized window that draws its own isn't there once it is restored */
++        if (data->custom_frame && LOWORD(*state_cmd) == SC_RESTORE) *rect = data->current_state.rect;
+         release_win_data( data );
+     }
+ 
+@@ -3284,6 +3287,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     if (!(new_style & WS_MINIMIZE) || is_virtual_desktop()) data->rects = *new_rects;
+     data->is_fullscreen = fullscreen;
+     data->is_resizable = !!(swp_flags & WINE_SWP_RESIZABLE);
++    data->custom_frame = !!(swp_flags & WINE_SWP_CUSTOM_FRAME);
+ 
+     TRACE( "win %p/%lx new_rects %s style %08x flags %08x\n", hwnd, data->whole_window,
+            debugstr_window_rects(new_rects), new_style, swp_flags );
+diff --git dlls/winex11.drv/x11drv.h dlls/winex11.drv/x11drv.h
+index a91c0e7..d774e46 100644
+--- dlls/winex11.drv/x11drv.h
++++ dlls/winex11.drv/x11drv.h
+@@ -694,6 +694,7 @@ struct x11drv_win_data
+     UINT        parent_invalid : 1; /* is the parent host window possibly invalid */
+     UINT        reparenting : 1; /* window is being reparented, likely from a decoration change */
+     UINT        is_resizable : 1; /* window is allowed to be resized by the window manager */
++    UINT        custom_frame : 1; /* window draws its own frame, the window manager mustn't add one */
+     Window      embedder;       /* window id of embedder */
+     Pixmap         icon_pixmap;
+     Pixmap         icon_mask;
+diff --git include/wine/gdi_driver.h include/wine/gdi_driver.h
+index 320850b..18d47ab 100644
+--- include/wine/gdi_driver.h
++++ include/wine/gdi_driver.h
+@@ -355,6 +355,7 @@ struct gdi_device_manager
+ #define WINE_DM_UNSUPPORTED 0x80000000
+ #define WINE_SWP_FULLSCREEN 0x80000000
+ #define WINE_SWP_RESIZABLE  0x40000000
++#define WINE_SWP_CUSTOM_FRAME 0x20000000
+ 
+ struct vulkan_driver_funcs;
+ struct opengl_driver_funcs;

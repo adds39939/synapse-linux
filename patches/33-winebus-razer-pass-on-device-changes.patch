@@ -1,0 +1,283 @@
+diff --git dlls/winebus.sys/bus_udev.c dlls/winebus.sys/bus_udev.c
+index 9ae538d..067fd52 100644
+--- dlls/winebus.sys/bus_udev.c
++++ dlls/winebus.sys/bus_udev.c
+@@ -114,6 +114,8 @@ static inline struct base_device *impl_from_unix_device(struct unix_device *ifac
+     return CONTAINING_RECORD(iface, struct base_device, unix_device);
+ }
+ 
++struct razer_state;
++
+ struct hidraw_device
+ {
+     struct base_device base;
+@@ -121,6 +123,7 @@ struct hidraw_device
+     BOOL razer;
+     BYTE razer_mode;
+     BYTE razer_mode_param;
++    struct razer_state *razer_state;  /* shared by the device's interfaces, see razer_notification() */
+ };
+ 
+ static inline struct hidraw_device *hidraw_impl_from_unix_device(struct unix_device *iface)
+@@ -290,10 +293,13 @@ static struct base_device *find_device_from_devnode(const char *path)
+     return NULL;
+ }
+ 
++static void razer_state_release(struct razer_state *state);
++
+ static void hidraw_device_destroy(struct unix_device *iface)
+ {
+     struct hidraw_device *impl = hidraw_impl_from_unix_device(iface);
+ 
++    razer_state_release(impl->razer_state);
+     udev_device_unref(impl->base.udev_device);
+ }
+ 
+@@ -349,6 +355,8 @@ static NTSTATUS hidraw_device_get_report_descriptor(struct unix_device *iface, B
+ }
+ 
+ #ifdef HAVE_LINUX_HIDRAW_H
++static void razer_notification(struct hidraw_device *impl, const BYTE *report, int size);
++
+ static void hidraw_device_read_report(struct unix_device *iface)
+ {
+     struct hidraw_device *impl = hidraw_impl_from_unix_device(iface);
+@@ -360,7 +368,10 @@ static void hidraw_device_read_report(struct unix_device *iface)
+     else if (size == 0)
+         TRACE("Failed to read report\n");
+     else
++    {
+         bus_event_queue_input_report(&event_queue, iface, buff, size);
++        if (impl->razer_state) razer_notification(impl, buff, size);
++    }
+ }
+ #endif
+ 
+@@ -428,6 +439,180 @@ static void razer_set_crc( BYTE *report )
+     report[88] = crc;
+ }
+ 
++/* In normal mode a Razer mouse acts on its own sensitivity and scroll mode buttons, and says
++ * what it did in a notification report on its keyboard interface:
++ *
++ *   05 02 xh xl yh yl ...    sensitivity changed
++ *   05 39 mm ...             scroll mode changed: 0 tactile, 1 free-spin, 2 precision tactile
++ *
++ * In driver mode, the mode the application believes the device to be in, the firmware leaves
++ * both alone and reports the buttons as Razer keys on the same interface instead -- 0x20 for
++ * sensitivity up, 0x21 for down, 0x54 for the scroll mode -- for Razer Synapse to act on.
++ * Synapse has no use for the notifications, so it never learned of a change made on the device.
++ * While the application thinks the device is in driver mode, turn a change the device made by
++ * itself into that key press: Synapse then steps on as it would have told the device to, and
++ * writes the result back.
++ *
++ * Telling such a change from one the application asked for takes knowing the state the device
++ * was in, which is followed from the application's requests to the control interface and the
++ * device's answers. A device's interfaces share it. */
++struct razer_state
++{
++    struct list entry;
++    LONG ref;
++    char syspath[MAX_PATH];      /* sysfs path of the USB device */
++    BOOL driver_mode;            /* the application asked for driver mode */
++    UINT dpi;                    /* sensitivity the device was last seen at, 0 if unknown */
++    BYTE stage;                  /* index of the active stage, 0xff if unknown */
++    BYTE stage_count;
++    UINT stages[8];              /* sensitivity of each stage, in order */
++    BYTE scroll_mode;            /* scroll mode the device was last seen in, 0xff if unknown */
++};
++
++#define RAZER_KEY_DPI_UP        0x20
++#define RAZER_KEY_DPI_DOWN      0x21
++#define RAZER_KEY_SCROLL_MODE   0x54
++
++static pthread_mutex_t razer_cs = PTHREAD_MUTEX_INITIALIZER;
++static struct list razer_states = LIST_INIT(razer_states);
++
++static struct razer_state *razer_state_get( struct udev_device *dev )
++{
++    struct udev_device *usb = udev_device_get_parent_with_subsystem_devtype( dev, "usb", "usb_device" );
++    const char *syspath = usb ? udev_device_get_syspath( usb ) : NULL;
++    struct razer_state *state;
++
++    if (!syspath || strlen( syspath ) >= MAX_PATH) return NULL;
++
++    pthread_mutex_lock( &razer_cs );
++    LIST_FOR_EACH_ENTRY( state, &razer_states, struct razer_state, entry )
++    {
++        if (strcmp( state->syspath, syspath )) continue;
++        state->ref++;
++        pthread_mutex_unlock( &razer_cs );
++        return state;
++    }
++    if ((state = calloc( 1, sizeof(*state) )))
++    {
++        state->ref = 1;
++        strcpy( state->syspath, syspath );
++        state->stage = 0xff;
++        state->scroll_mode = 0xff;
++        list_add_tail( &razer_states, &state->entry );
++    }
++    pthread_mutex_unlock( &razer_cs );
++    return state;
++}
++
++static void razer_state_release( struct razer_state *state )
++{
++    if (!state) return;
++    pthread_mutex_lock( &razer_cs );
++    if (!--state->ref)
++    {
++        list_remove( &state->entry );
++        free( state );
++    }
++    pthread_mutex_unlock( &razer_cs );
++}
++
++static void razer_note_driver_mode( struct hidraw_device *impl, BOOL driver_mode )
++{
++    if (!impl->razer_state) return;
++    pthread_mutex_lock( &razer_cs );
++    impl->razer_state->driver_mode = driver_mode;
++    pthread_mutex_unlock( &razer_cs );
++}
++
++/* A request on its way to the device, or the device's answer to one. Only the settings of
++ * the active profile are followed: storage / profile 0 or 1, not the on-board profile slots
++ * Synapse keeps in sync with it. */
++static void razer_track_state( struct hidraw_device *impl, const BYTE *report, unsigned int length )
++{
++    struct razer_state *state = impl->razer_state;
++    unsigned int i, count;
++
++    if (!state || length != RAZER_REPORT_SIZE) return;
++    if (report[0] != 0x00 && report[0] != 0x02) return; /* not a request, nor a successful answer */
++    if ((report[7] & 0x80) && report[0] != 0x02) return; /* a get request carries no values */
++    if (report[8] > 1) return;
++
++    pthread_mutex_lock( &razer_cs );
++    switch (report[6] << 8 | (report[7] & 0x7f))
++    {
++    case 0x0405: /* sensitivity: storage, x, y */
++        state->dpi = report[9] << 8 | report[10];
++        break;
++    case 0x0406: /* stages: storage, active stage from 1, count, then id, x, y, 0, 0 for each --
++                  * the ids count from 0 in a request and from 1 in an answer, the order is the same */
++        count = report[10];
++        if (count > ARRAY_SIZE(state->stages) || 11 + 7 * count > 88) break;
++        for (i = 0; i < count; i++) state->stages[i] = report[12 + 7 * i] << 8 | report[13 + 7 * i];
++        state->stage_count = count;
++        if (report[9] && report[9] <= count)
++        {
++            state->stage = report[9] - 1;
++            state->dpi = state->stages[state->stage];
++        }
++        break;
++    case 0x0230: /* scroll mode: profile, mode */
++        state->scroll_mode = report[9];
++        break;
++    }
++    pthread_mutex_unlock( &razer_cs );
++}
++
++static void razer_press_key( struct hidraw_device *impl, BYTE key )
++{
++    BYTE keys[16] = {0x04, key};
++
++    bus_event_queue_input_report( &event_queue, &impl->base.unix_device, keys, sizeof(keys) );
++    keys[1] = 0;
++    bus_event_queue_input_report( &event_queue, &impl->base.unix_device, keys, sizeof(keys) );
++}
++
++/* a report read from the device */
++static void razer_notification( struct hidraw_device *impl, const BYTE *report, int size )
++{
++    struct razer_state *state = impl->razer_state;
++    BYTE key = 0, stage = 0xff;
++    UINT dpi, i;
++
++    if (size != 16 || report[0] != 0x05) return;
++
++    pthread_mutex_lock( &razer_cs );
++    switch (report[1])
++    {
++    case 0x02: /* sensitivity changed */
++        dpi = report[2] << 8 | report[3];
++        for (i = 0; i < state->stage_count; i++) if (state->stages[i] == dpi) stage = i;
++        if (state->driver_mode && state->dpi && dpi != state->dpi)
++        {
++            /* stepping on from the last stage wraps around to the first */
++            if (stage != 0xff && state->stage != 0xff && state->stage_count > 2)
++            {
++                if (stage == (state->stage + 1) % state->stage_count) key = RAZER_KEY_DPI_UP;
++                else if (state->stage == (stage + 1) % state->stage_count) key = RAZER_KEY_DPI_DOWN;
++            }
++            if (!key) key = dpi > state->dpi ? RAZER_KEY_DPI_UP : RAZER_KEY_DPI_DOWN;
++        }
++        TRACE( "%s sensitivity %u -> %u, stage %u -> %u, pressing %#x\n", debugstr_a(impl->base.devnode),
++               state->dpi, dpi, state->stage, stage, key );
++        state->dpi = dpi;
++        state->stage = stage;
++        break;
++    case 0x39: /* scroll mode changed */
++        if (state->driver_mode && report[2] != state->scroll_mode) key = RAZER_KEY_SCROLL_MODE;
++        TRACE( "%s scroll mode %u -> %u, pressing %#x\n", debugstr_a(impl->base.devnode),
++               state->scroll_mode, report[2], key );
++        state->scroll_mode = report[2];
++        break;
++    }
++    pthread_mutex_unlock( &razer_cs );
++
++    if (key) razer_press_key( impl, key );
++}
++
+ /* a set device mode request on its way to the device */
+ static void razer_set_mode( struct hidraw_device *impl, BYTE *report, unsigned int length )
+ {
+@@ -435,6 +620,7 @@ static void razer_set_mode( struct hidraw_device *impl, BYTE *report, unsigned i
+ 
+     impl->razer_mode = report[8];
+     impl->razer_mode_param = report[9];
++    razer_note_driver_mode( impl, report[8] == RAZER_DRIVER_MODE );
+     if (report[8] != RAZER_DRIVER_MODE) return;
+ 
+     TRACE( "keeping %s in normal mode instead of driver mode\n", debugstr_a(impl->base.devnode) );
+@@ -471,6 +657,7 @@ static void razer_get_mode( struct hidraw_device *impl, BYTE *report, unsigned i
+             ioctl( impl->base.device_fd, HIDIOCGFEATURE(sizeof(answer)), answer );
+             impl->razer_mode = RAZER_DRIVER_MODE;
+             impl->razer_mode_param = report[9];
++            razer_note_driver_mode( impl, TRUE );
+         }
+         return;
+     }
+@@ -500,7 +687,11 @@ static void hidraw_device_get_feature_report(struct unix_device *iface, HID_XFER
+     {
+         count = ioctl(impl->base.device_fd, HIDIOCGFEATURE(length + 1), buffer);
+         memcpy(packet->reportBuffer, buffer + 1, length);
+-        if (count > 0) razer_get_mode(impl, packet->reportBuffer, length);
++        if (count > 0)
++        {
++            razer_get_mode(impl, packet->reportBuffer, length);
++            razer_track_state(impl, packet->reportBuffer, length);
++        }
+     }
+ 
+     if (count > 0)
+@@ -537,6 +728,7 @@ static void hidraw_device_set_feature_report(struct unix_device *iface, HID_XFER
+     {
+         memcpy(buffer + 1, packet->reportBuffer, length);
+         razer_set_mode(impl, buffer + 1, length);
++        razer_track_state(impl, buffer + 1, length);
+         count = ioctl(impl->base.device_fd, HIDIOCSFEATURE(length + 1), buffer);
+     }
+ 
+@@ -1317,7 +1509,8 @@ static NTSTATUS hidraw_device_create(struct udev_device *dev, int fd, const char
+ 
+     if (!(impl = raw_device_create(&hidraw_device_vtbl, sizeof(struct hidraw_device))))
+         return STATUS_NO_MEMORY;
+-    ((struct hidraw_device *)impl)->razer = desc.vid == 0x1532 && !options->razer_driver_mode;
++    if ((((struct hidraw_device *)impl)->razer = desc.vid == 0x1532 && !options->razer_driver_mode))
++        ((struct hidraw_device *)impl)->razer_state = razer_state_get(dev);
+     list_add_tail(&device_list, &impl->unix_device.entry);
+     impl->read_report = hidraw_device_read_report;
+     impl->udev_device = udev_device_ref(dev);
