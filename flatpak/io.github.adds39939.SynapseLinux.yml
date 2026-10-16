@@ -90,8 +90,8 @@ modules:
       - type: archive
         url: https://dl.winehq.org/wine/source/11.x/wine-11.16.tar.xz
         sha256: c66e2090343dcd727f7f7fd2f87ee0bfb0b118790c1d745ab7b8a4c3a4197f2f
-      # What each patch fixes, and why, is in docs/wine-fixes.md. 01-26 make Synapse work,
-      # and 27-30 cut how much memory it takes. They are -p0 patches, hence
+      # What each patch fixes, and why, is in docs/wine-fixes.md. 01-26 and 31-34 make
+      # Synapse work, and 27-30 cut how much memory it takes. They are -p0 patches, hence
       # strip-components: 0.
       - type: patch
         path: ../patches/01-propsys-hid-properties.patch
@@ -182,6 +182,18 @@ modules:
         strip-components: 0
       - type: patch
         path: ../patches/30-wined3d-smaller-allocator-chunks.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/31-winex11-no-decorations-for-own-frames.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/32-explorer-systray-allow-set-foreground.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/33-winebus-razer-pass-on-device-changes.patch
+        strip-components: 0
+      - type: patch
+        path: ../patches/34-win32u-wait-for-message-parent.patch
         strip-components: 0
 
   # Needed by winetricks to unpack the corefonts and .NET cabs on first run.

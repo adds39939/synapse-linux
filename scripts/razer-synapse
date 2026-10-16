@@ -42,6 +42,16 @@ case "${1:-}" in
   razer-synapse:*|razerappengine-synapse:*) set -- --url-params=apps=synapse "$@" ;;
 esac
 
+# Have App Engine's browser process paint its own windows, rather than its GPU process.
+# The GPU process draws into windows that belong to another process, which Wine can only
+# show by copying each frame across, and on EGL a frame late: a window that had just been
+# resized or shown kept its old picture or none at all. The tray flyout came up as a
+# white box, and a window maximized by dragging it to the top kept its old size. With
+# software compositing every window is painted by the process that owns it, as in any
+# Win32 program, and transparent ones like the flyout become layered windows, which Wine
+# handles. Synapse's pages are static enough that this costs about 2% of a core at 4K.
+set -- "$@" --disable-gpu-compositing
+
 mkdir -p "$WINEPREFIX"
 
 # ----------------------------------------------------------------- one at a time

@@ -106,6 +106,13 @@ Verified with a **Naga V2 Pro** on its HyperSpeed receiver (`1532:00a8`):
   on the desktop, while Synapse runs and after it quits. The mouse's own firmware applies
   them: Synapse stores every assignment on the mouse, and this build keeps the mouse in
   normal mode so it uses them (see [patch 25](docs/wine-fixes.md))
+* ✅ **Changes made on the mouse show in Synapse** — stepping the sensitivity with the
+  DPI buttons moves Synapse's active stage, and switching the wheel's scroll mode moves
+  its scroll mode selector, as on Windows (see [patch 33](docs/wine-fixes.md))
+* ✅ **The window** — maximized, from Synapse's own button or by dragging it to the top
+  of the screen, it fills the screen with only Synapse's own title bar
+* ✅ **The tray icon** — its menu opens on every right-click, and its flyout opens Synapse
+  from the tray
 * ✅ **Display scaling** matches your desktop's, so it is not tiny on a 4K panel
 
 ## Untested
@@ -176,17 +183,19 @@ That downloads Wine, applies every patch in `patches/`, builds it against the mi
 SDK extension, and installs the result. It takes a while — most of it is Wine. Nothing
 else has to be installed: the runtime and the SDK carry the compilers and the libraries.
 
-The patches are `-p0` patches against Wine 11.16 as upstream ships it: 01–26 are what
-Synapse needs, and 27–30 cut how much memory it takes. To build against a different Wine,
-change the `url` and `sha256` in the manifest's `wine` module and put the same version in
-[`WINE_VERSION`](WINE_VERSION) — CI checks the two agree.
+The patches are `-p0` patches against Wine 11.16 as upstream ships it: 01–26 and 31–34
+are what Synapse needs, and 27–30 cut how much memory it takes. To build against a
+different Wine, change the `url` and `sha256` in the manifest's `wine` module and put the
+same version in [`WINE_VERSION`](WINE_VERSION) — CI checks the two agree.
 
-Patches 21–24 and 26 are not Synapse-specific: they fix gaps that affect any application
-that walks its child processes, verifies MSIX packages, pairs a USB device with its HID
-interfaces, shrinks a window to nothing, or lists HID devices hidapi's way after one has
-been unplugged. 25 is the exception, by design — it keeps Razer devices in the mode their
-firmware applies their own assignments in, which only makes sense where no Razer filter
-driver can run.
+Patches 21–24, 26, 31, 32 and 34 are not Synapse-specific: they fix gaps that affect any
+application that walks its child processes, verifies MSIX packages, pairs a USB device
+with its HID interfaces, shrinks a window to nothing, lists HID devices hidapi's way after
+one has been unplugged, draws its own window frame, shows a menu from a tray icon, or
+creates a message-only window while Wine is still starting up. 25
+and 33 are the exception, by design — they keep Razer devices in the mode their firmware
+applies their own assignments in, and pass on what the firmware then changes by itself,
+which only makes sense where no Razer filter driver can run.
 
 ## Licensing
 

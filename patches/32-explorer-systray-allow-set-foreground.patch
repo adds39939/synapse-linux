@@ -1,0 +1,322 @@
+diff --git dlls/user32/win.c dlls/user32/win.c
+index bcf88ee..68e4bf9 100644
+--- dlls/user32/win.c
++++ dlls/user32/win.c
+@@ -778,9 +778,7 @@ BOOL WINAPI IsZoomed( HWND hwnd )
+  */
+ BOOL WINAPI AllowSetForegroundWindow( DWORD procid )
+ {
+-    /* FIXME: If Win98/2000 style SetForegroundWindow behavior is
+-     * implemented, then fix this function. */
+-    return TRUE;
++    return NtUserCallOneParam( procid, NtUserCallOneParam_AllowSetForegroundWindow );
+ }
+ 
+ 
+diff --git dlls/win32u/input.c dlls/win32u/input.c
+index 896b0d4..7d2c3e6 100644
+--- dlls/win32u/input.c
++++ dlls/win32u/input.c
+@@ -2295,6 +2295,24 @@ HWND WINAPI NtUserSetFocus( HWND hwnd )
+     return set_focus_window( hwnd );
+ }
+ 
++/*******************************************************************
++ *		allow_set_foreground_window
++ */
++BOOL allow_set_foreground_window( DWORD pid )
++{
++    BOOL ret;
++
++    SERVER_START_REQ( allow_set_foreground_window )
++    {
++        req->pid = pid;
++        ret = !wine_server_call_err( req );
++    }
++    SERVER_END_REQ;
++
++    TRACE( "pid %04x -> ret %u\n", pid, ret );
++    return ret;
++}
++
+ /*****************************************************************
+  *           NtUserSetForegroundWindow  (win32u.@)
+  */
+diff --git dlls/win32u/sysparams.c dlls/win32u/sysparams.c
+index fa22d62..d0876b9 100644
+--- dlls/win32u/sysparams.c
++++ dlls/win32u/sysparams.c
+@@ -7607,6 +7607,9 @@ ULONG_PTR WINAPI NtUserCallOneParam( ULONG_PTR arg, ULONG code )
+     case NtUserCallOneParam_GetAsyncKeyboardState:
+         return get_async_keyboard_state( (void *)arg );
+ 
++    case NtUserCallOneParam_AllowSetForegroundWindow:
++        return allow_set_foreground_window( arg );
++
+     /* temporary exports */
+     case NtUserGetDeskPattern:
+         return get_entry( &entry_DESKPATTERN, 256, (WCHAR *)arg );
+diff --git dlls/win32u/win32u_private.h dlls/win32u/win32u_private.h
+index 03f37ca..0d4a3e2 100644
+--- dlls/win32u/win32u_private.h
++++ dlls/win32u/win32u_private.h
+@@ -103,6 +103,7 @@ extern DWORD get_last_input_time(void);
+ extern BOOL get_async_keyboard_state( BYTE state[256] );
+ extern BOOL set_capture_window( HWND hwnd, UINT gui_flags, HWND *prev_ret );
+ extern BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL force );
++extern BOOL allow_set_foreground_window( DWORD pid );
+ extern BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new_active_thread_id );
+ extern BOOL set_ime_composition_rect( HWND hwnd, RECT rect );
+ extern void toggle_caret( HWND hwnd );
+diff --git include/ntuser.h include/ntuser.h
+index be41b33..e79c434 100644
+--- include/ntuser.h
++++ include/ntuser.h
+@@ -1123,6 +1123,7 @@ enum
+     NtUserCallOneParam_SetThreadDpiAwarenessContext,
+     NtUserCallOneParam_D3DKMTOpenAdapterFromGdiDisplayName,
+     NtUserCallOneParam_GetAsyncKeyboardState,
++    NtUserCallOneParam_AllowSetForegroundWindow,
+     /* temporary exports */
+     NtUserGetDeskPattern,
+ };
+diff --git include/wine/server_protocol.h include/wine/server_protocol.h
+index aea07b3..38bb06a 100644
+--- include/wine/server_protocol.h
++++ include/wine/server_protocol.h
+@@ -4365,6 +4365,17 @@ struct set_foreground_window_reply
+ };
+ 
+ 
++struct allow_set_foreground_window_request
++{
++    struct request_header __header;
++    process_id_t   pid;
++};
++struct allow_set_foreground_window_reply
++{
++    struct reply_header __header;
++};
++
++
+ struct set_focus_window_request
+ {
+     struct request_header __header;
+@@ -6439,6 +6450,7 @@ enum request
+     REQ_get_key_state,
+     REQ_set_key_state,
+     REQ_set_foreground_window,
++    REQ_allow_set_foreground_window,
+     REQ_set_focus_window,
+     REQ_set_active_window,
+     REQ_set_capture_window,
+@@ -6754,6 +6766,7 @@ union generic_request
+     struct get_key_state_request get_key_state_request;
+     struct set_key_state_request set_key_state_request;
+     struct set_foreground_window_request set_foreground_window_request;
++    struct allow_set_foreground_window_request allow_set_foreground_window_request;
+     struct set_focus_window_request set_focus_window_request;
+     struct set_active_window_request set_active_window_request;
+     struct set_capture_window_request set_capture_window_request;
+@@ -7067,6 +7080,7 @@ union generic_reply
+     struct get_key_state_reply get_key_state_reply;
+     struct set_key_state_reply set_key_state_reply;
+     struct set_foreground_window_reply set_foreground_window_reply;
++    struct allow_set_foreground_window_reply allow_set_foreground_window_reply;
+     struct set_focus_window_reply set_focus_window_reply;
+     struct set_active_window_reply set_active_window_reply;
+     struct set_capture_window_reply set_capture_window_reply;
+@@ -7183,6 +7197,6 @@ union generic_reply
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 962
++#define SERVER_PROTOCOL_VERSION 963
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git programs/explorer/systray.c programs/explorer/systray.c
+index 6280eb2..4b9785a 100644
+--- programs/explorer/systray.c
++++ programs/explorer/systray.c
+@@ -472,6 +472,14 @@ static BOOL notify_owner( struct icon *icon, UINT msg, LPARAM lparam )
+         lp = MAKELPARAM( msg, icon->id );
+     }
+ 
++    /* as on Windows, a click lets the icon's owner take the foreground: a context menu is
++     * typically shown after SetForegroundWindow, which fails for a background process */
++    if (msg != WM_MOUSEMOVE)
++    {
++        DWORD pid;
++        if (GetWindowThreadProcessId( icon->owner, &pid )) AllowSetForegroundWindow( pid );
++    }
++
+     TRACE( "relaying 0x%x\n", msg );
+     if (!SendNotifyMessageW( icon->owner, icon->callback_message, wp, lp ) &&
+         (GetLastError() == ERROR_INVALID_WINDOW_HANDLE))
+diff --git server/protocol.def server/protocol.def
+index d9403e2..e3d7af8 100644
+--- server/protocol.def
++++ server/protocol.def
+@@ -3183,6 +3183,11 @@ enum coords_relative
+     int            send_msg_new;  /* whether we have to send a msg to the new window */
+ @END
+ 
++/* Allow a process to set the foreground window, as AllowSetForegroundWindow */
++@REQ(allow_set_foreground_window)
++    process_id_t   pid;           /* process that may set the foreground window, -1 for any */
++@END
++
+ /* Set the current thread focus window */
+ @REQ(set_focus_window)
+     user_handle_t  handle;        /* handle to the focus window */
+diff --git server/queue.c server/queue.c
+index d2ff75d..4883eb2 100644
+--- server/queue.c
++++ server/queue.c
+@@ -1958,6 +1958,12 @@ static int is_current_process_foreground( struct desktop *desktop )
+            desktop->foreground_pid == current->process->parent_id;
+ }
+ 
++/* the foreground process allowed the current process to set the foreground, with AllowSetForegroundWindow */
++static int is_current_process_foreground_allowed( struct desktop *desktop )
++{
++    return desktop->foreground_allowed == current->process->id || desktop->foreground_allowed == (process_id_t)-1;
++}
++
+ /* user32 reserves 1 & 2 for winemouse and winekeyboard,
+  * keep this in sync with user_private.h */
+ #define WINE_MOUSE_HANDLE 1
+@@ -3803,12 +3809,15 @@ DECL_HANDLER(set_foreground_window)
+     if (set_foreground && !req->internal)
+     {
+         /* allow a process to set foreground after changing desktop, or each window to be set foreground at least once */
+-        if (!is_current_process_foreground( desktop ) && queue->input && desktop->foreground_input &&
++        if (!is_current_process_foreground( desktop ) && !is_current_process_foreground_allowed( desktop ) &&
++            queue->input && desktop->foreground_input &&
+             queue->input->user_time < desktop->foreground_input->user_time)
+         {
+             set_error( STATUS_ACCESS_DENIED );
+             goto done;
+         }
++        /* the permission is good for one foreground change */
++        if (is_current_process_foreground_allowed( desktop )) desktop->foreground_allowed = 0;
+     }
+ 
+     reply->previous = desktop->foreground_input ? desktop->foreground_input->shared->active : 0;
+@@ -3822,6 +3831,23 @@ done:
+ }
+ 
+ 
++/* allow a process to set the foreground window */
++DECL_HANDLER(allow_set_foreground_window)
++{
++    struct desktop *desktop;
++
++    if (!(desktop = get_thread_desktop( current, 0 ))) return;
++
++    /* only a process that could set the foreground itself can pass that on */
++    if (is_current_process_foreground( desktop ) || is_current_process_foreground_allowed( desktop ))
++        desktop->foreground_allowed = req->pid;
++    else
++        set_error( STATUS_ACCESS_DENIED );
++
++    release_object( desktop );
++}
++
++
+ /* set the current thread focus window */
+ DECL_HANDLER(set_focus_window)
+ {
+diff --git server/request_handlers.h server/request_handlers.h
+index 91010fb..cf644ee 100644
+--- server/request_handlers.h
++++ server/request_handlers.h
+@@ -201,6 +201,7 @@ DECL_HANDLER(set_user_input_time);
+ DECL_HANDLER(get_key_state);
+ DECL_HANDLER(set_key_state);
+ DECL_HANDLER(set_foreground_window);
++DECL_HANDLER(allow_set_foreground_window);
+ DECL_HANDLER(set_focus_window);
+ DECL_HANDLER(set_active_window);
+ DECL_HANDLER(set_capture_window);
+@@ -513,6 +514,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_get_key_state,
+     (req_handler)req_set_key_state,
+     (req_handler)req_set_foreground_window,
++    (req_handler)req_allow_set_foreground_window,
+     (req_handler)req_set_focus_window,
+     (req_handler)req_set_active_window,
+     (req_handler)req_set_capture_window,
+@@ -1770,6 +1772,8 @@ C_ASSERT( offsetof(struct set_foreground_window_reply, previous) == 8 );
+ C_ASSERT( offsetof(struct set_foreground_window_reply, send_msg_old) == 12 );
+ C_ASSERT( offsetof(struct set_foreground_window_reply, send_msg_new) == 16 );
+ C_ASSERT( sizeof(struct set_foreground_window_reply) == 24 );
++C_ASSERT( offsetof(struct allow_set_foreground_window_request, pid) == 12 );
++C_ASSERT( sizeof(struct allow_set_foreground_window_request) == 16 );
+ C_ASSERT( offsetof(struct set_focus_window_request, handle) == 12 );
+ C_ASSERT( sizeof(struct set_focus_window_request) == 16 );
+ C_ASSERT( offsetof(struct set_focus_window_reply, previous) == 8 );
+diff --git server/request_trace.h server/request_trace.h
+index 589c512..a761f55 100644
+--- server/request_trace.h
++++ server/request_trace.h
+@@ -2266,6 +2266,11 @@ static void dump_set_foreground_window_reply( const struct set_foreground_window
+     fprintf( stderr, ", send_msg_new=%d", req->send_msg_new );
+ }
+ 
++static void dump_allow_set_foreground_window_request( const struct allow_set_foreground_window_request *req )
++{
++    fprintf( stderr, " pid=%04x", req->pid );
++}
++
+ static void dump_set_focus_window_request( const struct set_focus_window_request *req )
+ {
+     fprintf( stderr, " handle=%08x", req->handle );
+@@ -3735,6 +3740,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_get_key_state_request,
+     (dump_func)dump_set_key_state_request,
+     (dump_func)dump_set_foreground_window_request,
++    (dump_func)dump_allow_set_foreground_window_request,
+     (dump_func)dump_set_focus_window_request,
+     (dump_func)dump_set_active_window_request,
+     (dump_func)dump_set_capture_window_request,
+@@ -4047,6 +4053,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_get_key_state_reply,
+     NULL,
+     (dump_func)dump_set_foreground_window_reply,
++    NULL,
+     (dump_func)dump_set_focus_window_reply,
+     (dump_func)dump_set_active_window_reply,
+     (dump_func)dump_set_capture_window_reply,
+@@ -4359,6 +4366,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "get_key_state",
+     "set_key_state",
+     "set_foreground_window",
++    "allow_set_foreground_window",
+     "set_focus_window",
+     "set_active_window",
+     "set_capture_window",
+diff --git server/user.h server/user.h
+index f1a1f07..9968b8a 100644
+--- server/user.h
++++ server/user.h
+@@ -80,6 +80,7 @@ struct desktop
+     struct timeout_user *close_timeout;    /* timeout before closing the desktop */
+     struct thread_input *foreground_input; /* thread input of foreground thread */
+     process_id_t         foreground_pid;   /* id of the foreground process */
++    process_id_t         foreground_allowed; /* process the foreground process allowed to set the foreground */
+     unsigned int         users;            /* processes and threads using this desktop */
+     unsigned char        alt_pressed;      /* last key press was Alt (used to determine msg on release) */
+     struct key_repeat    key_repeat;       /* key auto-repeat */
+diff --git server/winstation.c server/winstation.c
+index e2aad1e..57ef1ff 100644
+--- server/winstation.c
++++ server/winstation.c
+@@ -279,6 +279,7 @@ static bool desktop_init( struct object *obj, const void *init_data )
+     desktop->close_timeout = NULL;
+     desktop->foreground_input = NULL;
+     desktop->foreground_pid = 0;
++    desktop->foreground_allowed = 0;
+     desktop->users = 0;
+     desktop->clip_flags = 0;
+     desktop->cursor_win = 0;
